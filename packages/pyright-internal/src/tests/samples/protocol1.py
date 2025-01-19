@@ -1,6 +1,6 @@
 # This sample tests the type checker's handling of generic protocol types.
 
-from typing import Generic, List, Optional, TypeVar, Protocol
+from typing import Generic, Protocol, TypeVar
 
 T = TypeVar("T")
 T_co = TypeVar("T_co", covariant=True)
@@ -73,16 +73,16 @@ var = another_var2
 
 # This should generate an error because "Protocol" cannot be used
 # as a type argument.
-var2: List[Protocol] = []
+var2: list[Protocol] = []
 
 
 class Abstract1(Protocol[T_contra]):
-    def do(self, x: Optional[T_contra]):
+    def do(self, x: T_contra | None):
         ...
 
 
 class Concrete1:
-    def do(self, x: Optional[int]):
+    def do(self, x: int | None):
         pass
 
 
@@ -130,3 +130,19 @@ p5_1: Proto5[float, int]
 # This should generate an error because the second type argument
 # corresponds to _B, which is bound to int.
 p5_2: Proto5[int, float]
+
+
+def func1():
+    # This should generate an error because Protocol isn't
+    # allowed in a type annotation.
+    v: Protocol | int
+
+
+# This should generate an error because Protocol isn't
+# allowed in a TypeVar bound.
+T = TypeVar("T", bound=Protocol | int)
+
+
+# This should generate an error because int is not a TypeVar
+class Proto6(Protocol[int]):
+    pass

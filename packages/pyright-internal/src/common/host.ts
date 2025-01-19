@@ -3,12 +3,15 @@
  * Copyright (c) Microsoft Corporation.
  * Licensed under the MIT license.
  *
- * Provides accesses to the host the language service runs on
+ * Provides access to the host environment the language service is running on.
  */
+
+import { CancellationToken } from 'vscode-languageserver';
 
 import { PythonPathResult } from '../analyzer/pythonPathUtils';
 import { PythonPlatform } from './configOptions';
 import { PythonVersion } from './pythonVersion';
+import { Uri } from './uri/uri';
 
 export const enum HostKind {
     FullAccess,
@@ -16,11 +19,23 @@ export const enum HostKind {
     NoAccess,
 }
 
+export interface ScriptOutput {
+    stdout: string;
+    stderr: string;
+}
+
 export interface Host {
     readonly kind: HostKind;
-    getPythonSearchPaths(pythonPath?: string, logInfo?: string[]): PythonPathResult;
-    getPythonVersion(pythonPath?: string, logInfo?: string[]): PythonVersion | undefined;
+    getPythonSearchPaths(pythonPath?: Uri, logInfo?: string[]): PythonPathResult;
+    getPythonVersion(pythonPath?: Uri, logInfo?: string[]): PythonVersion | undefined;
     getPythonPlatform(logInfo?: string[]): PythonPlatform | undefined;
+    runScript(
+        pythonPath: Uri | undefined,
+        script: Uri,
+        args: string[],
+        cwd: Uri,
+        token: CancellationToken
+    ): Promise<ScriptOutput>;
 }
 
 export class NoAccessHost implements Host {
@@ -28,21 +43,31 @@ export class NoAccessHost implements Host {
         return HostKind.NoAccess;
     }
 
-    getPythonSearchPaths(pythonPath?: string, logInfo?: string[]): PythonPathResult {
+    getPythonSearchPaths(pythonPath?: Uri, logInfo?: string[]): PythonPathResult {
         logInfo?.push('No access to python executable.');
 
         return {
             paths: [],
-            prefix: '',
+            prefix: undefined,
         };
     }
 
-    getPythonVersion(pythonPath?: string, logInfo?: string[]): PythonVersion | undefined {
+    getPythonVersion(pythonPath?: Uri, logInfo?: string[]): PythonVersion | undefined {
         return undefined;
     }
 
     getPythonPlatform(logInfo?: string[]): PythonPlatform | undefined {
         return undefined;
+    }
+
+    async runScript(
+        pythonPath: Uri | undefined,
+        scriptPath: Uri,
+        args: string[],
+        cwd: Uri,
+        token: CancellationToken
+    ): Promise<ScriptOutput> {
+        return { stdout: '', stderr: '' };
     }
 }
 

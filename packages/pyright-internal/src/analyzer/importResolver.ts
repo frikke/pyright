@@ -11,56 +11,42 @@
 import type { Dirent } from 'fs';
 
 import { appendArray, flatten, getMapValues, getOrAdd } from '../common/collectionUtils';
-import { ConfigOptions, ExecutionEnvironment } from '../common/configOptions';
-import { FileSystem } from '../common/fileSystem';
+import { ConfigOptions, ExecutionEnvironment, matchFileSpecs } from '../common/configOptions';
 import { Host } from '../common/host';
 import { stubsSuffix } from '../common/pathConsts';
-import {
-    changeAnyExtension,
-    combinePathComponents,
-    combinePaths,
-    containsPath,
-    ensureTrailingDirectorySeparator,
-    getDirectoryPath,
-    getFileExtension,
-    getFileName,
-    getFileSystemEntriesFromDirEntries,
-    getPathComponents,
-    getRelativePathComponentsFromDirectory,
-    isDirectory,
-    isDiskPathRoot,
-    isFile,
-    normalizePath,
-    normalizePathCase,
-    resolvePaths,
-    stripFileExtension,
-    stripTrailingDirectorySeparator,
-    tryRealpath,
-    tryStat,
-} from '../common/pathUtils';
-import { PythonVersion, versionFromString } from '../common/pythonVersion';
-import { equateStringsCaseInsensitive } from '../common/stringUtils';
+import { stripFileExtension } from '../common/pathUtils';
+import { PythonVersion, pythonVersion3_0 } from '../common/pythonVersion';
+import { ServiceKeys } from '../common/serviceKeys';
+import { ServiceProvider } from '../common/serviceProvider';
 import * as StringUtils from '../common/stringUtils';
-import { isIdentifierChar, isIdentifierStartChar } from '../parser/characters';
-import { SupportPartialStubs } from '../pyrightFileSystem';
+import { equateStringsCaseInsensitive } from '../common/stringUtils';
+import { Uri } from '../common/uri/uri';
+import { getFileSystemEntriesFromDirEntries, isDirectory, isFile, tryRealpath, tryStat } from '../common/uri/uriUtils';
+import { Tokenizer } from '../parser/tokenizer';
 import { ImplicitImport, ImportResult, ImportType } from './importResult';
 import { getDirectoryLeadingDotsPointsTo } from './importStatementUtils';
 import { ImportPath, ParentDirectoryCache } from './parentDirectoryCache';
+import { PyTypedInfo, getPyTypedInfoForPyTypedFile } from './pyTypedUtils';
 import * as PythonPathUtils from './pythonPathUtils';
-import { getPyTypedInfo, PyTypedInfo } from './pyTypedUtils';
+import * as SymbolNameUtils from './symbolNameUtils';
 import { isDunderName } from './symbolNameUtils';
 
 export interface ImportedModuleDescriptor {
     leadingDots: number;
     nameParts: string[];
     hasTrailingDot?: boolean | undefined;
-    importedSymbols: string[] | undefined;
+    importedSymbols: Set<string> | undefined;
 }
 
 export interface ModuleNameAndType {
     moduleName: string;
     importType: ImportType;
     isLocalTypingsFile: boolean;
+}
+
+export interface ModuleImportInfo extends ModuleNameAndType {
+    isTypeshedFile: boolean;
+    isThirdPartyPyTypedPresent: boolean;
 }
 
 export interface ModuleNameInfoFromPath {
@@ -70,7 +56,7 @@ export interface ModuleNameInfoFromPath {
 
 export function createImportedModuleDescriptor(moduleName: string): ImportedModuleDescriptor {
     if (moduleName.length === 0) {
-        return { leadingDots: 0, nameParts: [], importedSymbols: [] };
+        return { leadingDots: 0, nameParts: [], importedSymbols: new Set<string>() };
     }
 
     let startIndex = 0;
@@ -86,18 +72,20 @@ export function createImportedModuleDescriptor(moduleName: string): ImportedModu
     return {
         leadingDots,
         nameParts: moduleName.slice(startIndex).split('.'),
-        importedSymbols: [],
+        importedSymbols: new Set<string>(),
     };
 }
 
 type CachedImportResults = Map<string, ImportResult>;
-interface SupportedVersionRange {
+interface SupportedVersionInfo {
     min: PythonVersion;
     max?: PythonVersion | undefined;
+    unsupportedPlatforms?: string[];
+    supportedPlatforms?: string[];
 }
 
 const supportedNativeLibExtensions = ['.pyd', '.so', '.dylib'];
-export const supportedSourceFileExtensions = ['.py', '.pyi'];
+const supportedSourceFileExtensions = ['.py', '.pyi'];
 export const supportedFileExtensions = [...supportedSourceFileExtensions, ...supportedNativeLibExtensions];
 
 // Should we allow partial resolution for third-party packages? Some use tricks
@@ -108,241 +96,90 @@ export const supportedFileExtensions = [...supportedSourceFileExtensions, ...sup
 const allowPartialResolutionForThirdPartyPackages = false;
 
 export class ImportResolver {
-    private _cachedPythonSearchPaths: string[] | undefined;
+    private _cachedPythonSearchPaths: { paths: Uri[]; failureInfo: string[] } | undefined;
     private _cachedImportResults = new Map<string | undefined, CachedImportResults>();
-    private _cachedModuleNameResults = new Map<string, Map<string, ModuleNameAndType>>();
-    private _cachedTypeshedRoot: string | undefined;
-    private _cachedTypeshedStdLibPath: string | undefined;
-    private _cachedTypeshedStdLibModuleVersions: Map<string, SupportedVersionRange> | undefined;
-    private _cachedTypeshedThirdPartyPath: string | undefined;
-    private _cachedTypeshedThirdPartyPackagePaths: Map<string, string[]> | undefined;
-    private _cachedTypeshedThirdPartyPackageRoots: string[] | undefined;
+    private _cachedModuleNameResults = new Map<string, Map<string, ModuleImportInfo>>();
+    private _cachedTypeshedRoot: Uri | undefined;
+    private _cachedTypeshedStdLibPath: Uri | undefined;
+    private _cachedTypeshedStdLibModuleVersionInfo: Map<string, SupportedVersionInfo> | undefined;
+    private _cachedTypeshedThirdPartyPath: Uri | undefined;
+    private _cachedTypeshedThirdPartyPackagePaths: Map<string, Uri[]> | undefined;
+    private _cachedTypeshedThirdPartyPackageRoots: Uri[] | undefined;
     private _cachedEntriesForPath = new Map<string, Dirent[]>();
+    private _cachedFilesForPath = new Map<string, Uri[]>();
+    private _cachedDirExistenceForRoot = new Map<string, boolean>();
     private _stdlibModules: Set<string> | undefined;
-    protected cachedParentImportResults: ParentDirectoryCache;
 
-    constructor(
-        public readonly fileSystem: FileSystem,
-        protected _configOptions: ConfigOptions,
-        public readonly host: Host
-    ) {
+    protected readonly cachedParentImportResults: ParentDirectoryCache;
+
+    constructor(readonly serviceProvider: ServiceProvider, private _configOptions: ConfigOptions, readonly host: Host) {
         this.cachedParentImportResults = new ParentDirectoryCache(() => this.getPythonSearchPaths([]));
+    }
+
+    get fileSystem() {
+        return this.serviceProvider.fs();
+    }
+
+    get tmp() {
+        return this.serviceProvider.tmp();
+    }
+
+    get partialStubs() {
+        return this.serviceProvider.tryGet(ServiceKeys.partialStubs);
+    }
+
+    static isSupportedImportSourceFile(uri: Uri) {
+        const fileExtension = uri.lastExtension.toLowerCase();
+        return supportedSourceFileExtensions.some((ext) => fileExtension === ext);
+    }
+
+    static isSupportedImportFile(uri: Uri) {
+        const fileExtension = uri.lastExtension.toLowerCase();
+        return supportedFileExtensions.some((ext) => fileExtension === ext);
     }
 
     invalidateCache() {
         this._cachedImportResults = new Map<string | undefined, CachedImportResults>();
-        this._cachedModuleNameResults = new Map<string, Map<string, ModuleNameAndType>>();
+        this._cachedModuleNameResults = new Map<string, Map<string, ModuleImportInfo>>();
         this.cachedParentImportResults.reset();
         this._stdlibModules = undefined;
 
         this._invalidateFileSystemCache();
 
-        if (SupportPartialStubs.is(this.fileSystem)) {
-            this.fileSystem.clearPartialStubs();
-        }
+        this.partialStubs?.clearPartialStubs();
     }
 
     // Resolves the import and returns the path if it exists, otherwise
     // returns undefined.
     resolveImport(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor
     ): ImportResult {
-        // Wrap internal call to _resolveImport() to prevent calling any
+        // Wrap internal call to resolveImportInternal() to prevent calling any
         // child class version of resolveImport().
-        return this._resolveImport(sourceFilePath, execEnv, moduleDescriptor);
-    }
-
-    // Resolves the import and returns the path if it exists, otherwise
-    // returns undefined.
-    protected _resolveImport(
-        sourceFilePath: string,
-        execEnv: ExecutionEnvironment,
-        moduleDescriptor: ImportedModuleDescriptor
-    ): ImportResult {
-        const importName = this.formatImportName(moduleDescriptor);
-        const importFailureInfo: string[] = [];
-        const importResult = this._resolveImportStrict(
-            importName,
-            sourceFilePath,
-            execEnv,
-            moduleDescriptor,
-            importFailureInfo
-        );
-
-        if (importResult.isImportFound || moduleDescriptor.leadingDots > 0) {
-            return importResult;
-        }
-
-        // If the import is absolute and no other method works, try resolving the
-        // absolute in the importing file's directory, then the parent directory,
-        // and so on, until the import root is reached.
-        sourceFilePath = normalizePathCase(this.fileSystem, normalizePath(sourceFilePath));
-        const origin = ensureTrailingDirectorySeparator(getDirectoryPath(sourceFilePath));
-
-        const result = this.cachedParentImportResults.getImportResult(origin, importName, importResult);
-        if (result) {
-            // Already ran the parent directory resolution for this import name on this location.
-            return this.filterImplicitImports(result, moduleDescriptor.importedSymbols);
-        }
-
-        // Check whether the given file is in the parent directory import resolution cache.
-        const root = this.getParentImportResolutionRoot(sourceFilePath, execEnv.root);
-        if (!this.cachedParentImportResults.checkValidPath(this.fileSystem, sourceFilePath, root)) {
-            return importResult;
-        }
-
-        const importPath: ImportPath = { importPath: undefined };
-
-        // Going up the given folder one by one until we can resolve the import.
-        let current = origin;
-        while (this._shouldWalkUp(current, root, execEnv)) {
-            const result = this.resolveAbsoluteImport(
-                current,
-                execEnv,
-                moduleDescriptor,
-                importName,
-                [],
-                /* allowPartial */ undefined,
-                /* allowNativeLib */ undefined,
-                /* useStubPackage */ false,
-                /* allowPyi */ true
-            );
-
-            this.cachedParentImportResults.checked(current, importName, importPath);
-
-            if (result.isImportFound) {
-                // This will make cache to point to actual path that contains the module we found
-                importPath.importPath = current;
-
-                this.cachedParentImportResults.add({
-                    importResult: result,
-                    path: current,
-                    importName,
-                });
-
-                return this.filterImplicitImports(result, moduleDescriptor.importedSymbols);
-            }
-
-            let success;
-            [success, current] = this._tryWalkUp(current);
-            if (!success) {
-                break;
-            }
-        }
-
-        this.cachedParentImportResults.checked(current, importName, importPath);
-        return importResult;
-    }
-
-    private _resolveImportStrict(
-        importName: string,
-        sourceFilePath: string,
-        execEnv: ExecutionEnvironment,
-        moduleDescriptor: ImportedModuleDescriptor,
-        importFailureInfo: string[]
-    ) {
-        const notFoundResult: ImportResult = {
-            importName,
-            isRelative: false,
-            isImportFound: false,
-            isPartlyResolved: false,
-            isNamespacePackage: false,
-            isInitFilePresent: false,
-            isStubPackage: false,
-            importFailureInfo,
-            resolvedPaths: [],
-            importType: ImportType.Local,
-            isStubFile: false,
-            isNativeLib: false,
-            implicitImports: [],
-            filteredImplicitImports: [],
-            nonStubImportResult: undefined,
-        };
-
-        this.ensurePartialStubPackages(execEnv);
-
-        // Is it a relative import?
-        if (moduleDescriptor.leadingDots > 0) {
-            const relativeImport = this._resolveRelativeImport(
-                sourceFilePath,
-                execEnv,
-                moduleDescriptor,
-                importName,
-                importFailureInfo
-            );
-
-            if (relativeImport) {
-                relativeImport.isRelative = true;
-                return relativeImport;
-            }
-        } else {
-            // Is it already cached?
-            const cachedResults = this._lookUpResultsInCache(execEnv, importName, moduleDescriptor.importedSymbols);
-
-            if (cachedResults) {
-                // In most cases, we can simply return a cached entry. However, there are cases
-                // where the cached entry refers to a previously-resolved namespace package
-                // that does not resolve the symbols specified in the module descriptor.
-                // In this case, we will ignore the cached value and run the full import
-                // resolution again to try to find a package that resolves the import.
-                const isUnresolvedNamespace =
-                    cachedResults.isImportFound &&
-                    cachedResults.isNamespacePackage &&
-                    !this._isNamespacePackageResolved(moduleDescriptor, cachedResults.implicitImports);
-
-                if (!isUnresolvedNamespace) {
-                    return cachedResults;
-                }
-            }
-
-            const bestImport = this._resolveBestAbsoluteImport(
-                sourceFilePath,
-                execEnv,
-                moduleDescriptor,
-                /* allowPyi */ true
-            );
-
-            if (bestImport) {
-                if (bestImport.isStubFile) {
-                    bestImport.nonStubImportResult =
-                        this._resolveBestAbsoluteImport(
-                            sourceFilePath,
-                            execEnv,
-                            moduleDescriptor,
-                            /* allowPyi */ false
-                        ) || notFoundResult;
-                }
-
-                return this.addResultsToCache(execEnv, importName, bestImport, moduleDescriptor.importedSymbols);
-            }
-        }
-
-        return this.addResultsToCache(execEnv, importName, notFoundResult, /* importedSymbols */ undefined);
+        return this.resolveImportInternal(sourceFileUri, execEnv, moduleDescriptor);
     }
 
     getCompletionSuggestions(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor
     ) {
-        const suggestions = this._getCompletionSuggestionsStrict(sourceFilePath, execEnv, moduleDescriptor);
+        const suggestions = this._getCompletionSuggestionsStrict(sourceFileUri, execEnv, moduleDescriptor);
 
         // We only do parent import resolution for absolute path.
         if (moduleDescriptor.leadingDots > 0) {
             return suggestions;
         }
 
-        const root = this.getParentImportResolutionRoot(sourceFilePath, execEnv.root);
-        const origin = ensureTrailingDirectorySeparator(
-            getDirectoryPath(normalizePathCase(this.fileSystem, normalizePath(sourceFilePath)))
-        );
+        const root = getParentImportResolutionRoot(sourceFileUri, execEnv.root);
+        const origin = sourceFileUri.getDirectory();
 
-        let current = origin;
-        while (this._shouldWalkUp(current, root, execEnv)) {
+        let current: Uri | undefined = origin;
+        while (this._shouldWalkUp(current, root, execEnv) && current) {
             this._getCompletionSuggestionsAbsolute(
-                sourceFilePath,
+                sourceFileUri,
                 execEnv,
                 current,
                 moduleDescriptor,
@@ -350,97 +187,24 @@ export class ImportResolver {
                 /* strictOnly */ false
             );
 
-            let success;
-            [success, current] = this._tryWalkUp(current);
-            if (!success) {
-                break;
-            }
+            current = this._tryWalkUp(current);
         }
 
         return suggestions;
     }
 
-    getConfigOption() {
+    getConfigOptions() {
         return this._configOptions;
     }
 
-    private _getCompletionSuggestionsStrict(
-        sourceFilePath: string,
-        execEnv: ExecutionEnvironment,
-        moduleDescriptor: ImportedModuleDescriptor
-    ): Set<string> {
-        const importFailureInfo: string[] = [];
-        const suggestions = new Set<string>();
-
-        // Is it a relative import?
-        if (moduleDescriptor.leadingDots > 0) {
-            this._getCompletionSuggestionsRelative(sourceFilePath, execEnv, moduleDescriptor, suggestions);
-        } else {
-            // First check for a typeshed file.
-            if (moduleDescriptor.nameParts.length > 0) {
-                this._getCompletionSuggestionsTypeshedPath(
-                    sourceFilePath,
-                    execEnv,
-                    moduleDescriptor,
-                    true,
-                    suggestions
-                );
-            }
-
-            // Look for it in the root directory of the execution environment.
-            if (execEnv.root) {
-                this._getCompletionSuggestionsAbsolute(
-                    sourceFilePath,
-                    execEnv,
-                    execEnv.root,
-                    moduleDescriptor,
-                    suggestions
-                );
-            }
-
-            for (const extraPath of execEnv.extraPaths) {
-                this._getCompletionSuggestionsAbsolute(
-                    sourceFilePath,
-                    execEnv,
-                    extraPath,
-                    moduleDescriptor,
-                    suggestions
-                );
-            }
-
-            // Check for a typings file.
-            if (this._configOptions.stubPath) {
-                this._getCompletionSuggestionsAbsolute(
-                    sourceFilePath,
-                    execEnv,
-                    this._configOptions.stubPath,
-                    moduleDescriptor,
-                    suggestions
-                );
-            }
-
-            // Check for a typeshed file.
-            this._getCompletionSuggestionsTypeshedPath(sourceFilePath, execEnv, moduleDescriptor, false, suggestions);
-
-            // Look for the import in the list of third-party packages.
-            const pythonSearchPaths = this.getPythonSearchPaths(importFailureInfo);
-            for (const searchPath of pythonSearchPaths) {
-                this._getCompletionSuggestionsAbsolute(
-                    sourceFilePath,
-                    execEnv,
-                    searchPath,
-                    moduleDescriptor,
-                    suggestions
-                );
-            }
-        }
-
-        return suggestions;
+    setConfigOptions(configOptions: ConfigOptions): void {
+        this._configOptions = configOptions;
+        this.invalidateCache();
     }
 
     // Returns the implementation file(s) for the given stub file.
-    getSourceFilesFromStub(stubFilePath: string, execEnv: ExecutionEnvironment, _mapCompiled: boolean): string[] {
-        const sourceFilePaths: string[] = [];
+    getSourceFilesFromStub(stubFileUri: Uri, execEnv: ExecutionEnvironment, _mapCompiled: boolean): Uri[] {
+        const sourceFileUris: Uri[] = [];
 
         // When ImportResolver resolves an import to a stub file, a second resolve is done
         // ignoring stub files, which gives us an approximation of where the implementation
@@ -448,17 +212,17 @@ export class ImportResolver {
         this._cachedImportResults.forEach((map) => {
             map.forEach((result) => {
                 if (result.isStubFile && result.isImportFound && result.nonStubImportResult) {
-                    if (result.resolvedPaths[result.resolvedPaths.length - 1] === stubFilePath) {
+                    if (result.resolvedUris[result.resolvedUris.length - 1].equals(stubFileUri)) {
                         if (result.nonStubImportResult.isImportFound) {
-                            const nonEmptyPath =
-                                result.nonStubImportResult.resolvedPaths[
-                                    result.nonStubImportResult.resolvedPaths.length - 1
+                            const nonEmptyUri =
+                                result.nonStubImportResult.resolvedUris[
+                                    result.nonStubImportResult.resolvedUris.length - 1
                                 ];
 
-                            if (nonEmptyPath.endsWith('.py') || nonEmptyPath.endsWith('.pyi')) {
+                            if (nonEmptyUri.hasExtension('.py') || nonEmptyUri.hasExtension('.pyi')) {
                                 // We allow pyi in case there are multiple pyi for a compiled module such as
                                 // numpy.random.mtrand
-                                sourceFilePaths.push(nonEmptyPath);
+                                sourceFileUris.push(nonEmptyUri);
                             }
                         }
                     }
@@ -468,15 +232,15 @@ export class ImportResolver {
 
         // We haven't seen an import of that stub, attempt to find the source
         // in some other ways.
-        if (sourceFilePaths.length === 0) {
+        if (sourceFileUris.length === 0) {
             // Simple case where the stub and source files are next to each other.
-            const sourceFilePath = changeAnyExtension(stubFilePath, '.py');
-            if (this.dirExistsCached(sourceFilePath)) {
-                sourceFilePaths.push(sourceFilePath);
+            const sourceFileUri = stubFileUri.replaceExtension('.py');
+            if (this.dirExistsCached(sourceFileUri)) {
+                sourceFileUris.push(sourceFileUri);
             }
         }
 
-        if (sourceFilePaths.length === 0) {
+        if (sourceFileUris.length === 0) {
             // The stub and the source file may have the same name, but be located
             // in different folder hierarchies.
             // Example:
@@ -485,53 +249,48 @@ export class ImportResolver {
             // We get the relative path(s) of the stub to its import root(s),
             // in theory there can be more than one, then look for source
             // files in all the import roots using the same relative path(s).
-            const importRootPaths = this.getImportRoots(execEnv);
+            const importRoots = this.getImportRoots(execEnv);
 
             const relativeStubPaths: string[] = [];
-            for (const importRootPath of importRootPaths) {
-                if (containsPath(importRootPath, stubFilePath, true)) {
-                    const parts = getRelativePathComponentsFromDirectory(importRootPath, stubFilePath, true);
+            for (const importRootUri of importRoots) {
+                if (stubFileUri.isChild(importRootUri)) {
+                    const parts = Array.from(importRootUri.getRelativePathComponents(stubFileUri));
 
-                    // Note that relative paths have an empty parts[0]
-                    if (parts.length > 1) {
+                    if (parts.length >= 1) {
                         // Handle the case where the symbol was resolved to a stubs package
                         // rather than the real package. We'll strip off the "-stubs" suffix
                         // in this case.
-                        if (parts[1].endsWith(stubsSuffix)) {
-                            parts[1] = parts[1].substr(0, parts[1].length - stubsSuffix.length);
+                        if (parts[0].endsWith(stubsSuffix)) {
+                            parts[0] = parts[0].slice(0, parts[0].length - stubsSuffix.length);
                         }
 
-                        const relativeStubPath = combinePathComponents(parts);
-                        if (relativeStubPath) {
-                            relativeStubPaths.push(relativeStubPath);
-                        }
+                        relativeStubPaths.push(parts.join('/'));
                     }
                 }
             }
 
             for (const relativeStubPath of relativeStubPaths) {
-                for (const importRootPath of importRootPaths) {
-                    const absoluteStubPath = resolvePaths(importRootPath, relativeStubPath);
-                    let absoluteSourcePath = changeAnyExtension(absoluteStubPath, '.py');
+                for (const importRootUri of importRoots) {
+                    const absoluteStubPath = importRootUri.resolvePaths(relativeStubPath);
+                    let absoluteSourcePath = absoluteStubPath.replaceExtension('.py');
                     if (this.fileExistsCached(absoluteSourcePath)) {
-                        sourceFilePaths.push(absoluteSourcePath);
+                        sourceFileUris.push(absoluteSourcePath);
                     } else {
-                        const filePathWithoutExtension = stripFileExtension(absoluteSourcePath);
+                        const filePathWithoutExtension = absoluteSourcePath.stripExtension();
 
-                        if (filePathWithoutExtension.endsWith('__init__')) {
+                        if (filePathWithoutExtension.pathEndsWith('__init__')) {
                             // Did not match: <root>/package/__init__.py
                             // Try equivalent: <root>/package.py
-                            absoluteSourcePath =
-                                filePathWithoutExtension.substr(0, filePathWithoutExtension.length - 9) + '.py';
+                            absoluteSourcePath = filePathWithoutExtension.getDirectory().packageUri;
                             if (this.fileExistsCached(absoluteSourcePath)) {
-                                sourceFilePaths.push(absoluteSourcePath);
+                                sourceFileUris.push(absoluteSourcePath);
                             }
                         } else {
                             // Did not match: <root>/package.py
                             // Try equivalent: <root>/package/__init__.py
-                            absoluteSourcePath = combinePaths(filePathWithoutExtension, '__init__.py');
+                            absoluteSourcePath = filePathWithoutExtension.initPyUri;
                             if (this.fileExistsCached(absoluteSourcePath)) {
-                                sourceFilePaths.push(absoluteSourcePath);
+                                sourceFileUris.push(absoluteSourcePath);
                             }
                         }
                     }
@@ -539,177 +298,48 @@ export class ImportResolver {
             }
         }
 
-        return sourceFilePaths;
+        return sourceFileUris;
     }
 
     // Returns the module name (of the form X.Y.Z) that needs to be imported
     // from the current context to access the module with the specified file path.
     // In a sense, it's performing the inverse of resolveImport.
-    getModuleNameForImport(filePath: string, execEnv: ExecutionEnvironment, allowInvalidModuleName = false) {
-        // Cache results of the reverse of resolveImport as we cache resolveImport.
-        const cache = getOrAdd(this._cachedModuleNameResults, execEnv.root, () => new Map<string, ModuleNameAndType>());
-        return getOrAdd(cache, filePath, () => this._getModuleNameForImport(filePath, execEnv, allowInvalidModuleName));
-    }
-
-    private _getModuleNameForImport(
-        filePath: string,
+    getModuleNameForImport(
+        fileUri: Uri,
         execEnv: ExecutionEnvironment,
-        allowInvalidModuleName: boolean
-    ): ModuleNameAndType {
-        let moduleName: string | undefined;
-        let importType = ImportType.BuiltIn;
-        let isLocalTypingsFile = false;
-
-        const importFailureInfo: string[] = [];
-
-        // If we cannot find a fully-qualified module name with legal characters,
-        // look for one with invalid characters (e.g. "-"). This is important to
-        // differentiate between different modules in a project in case they
-        // declare types with the same (local) name.
-        let moduleNameWithInvalidCharacters: string | undefined;
-
-        // Is this a stdlib typeshed path?
-        const stdLibTypeshedPath = this._getStdlibTypeshedPath(execEnv, importFailureInfo);
-        if (stdLibTypeshedPath) {
-            moduleName = this.getModuleNameFromPath(stdLibTypeshedPath, filePath);
-            if (moduleName) {
-                const moduleDescriptor: ImportedModuleDescriptor = {
-                    leadingDots: 0,
-                    nameParts: moduleName.split('.'),
-                    importedSymbols: undefined,
-                };
-
-                if (this._isStdlibTypeshedStubValidForVersion(moduleDescriptor, execEnv, [])) {
-                    return { moduleName, importType, isLocalTypingsFile };
-                }
-            }
-        }
-
-        // Look for it in the root directory of the execution environment.
-        if (execEnv.root) {
-            const candidateModuleNameInfo = this.getModuleNameInfoFromPath(execEnv.root, filePath);
-
-            if (candidateModuleNameInfo) {
-                if (candidateModuleNameInfo.containsInvalidCharacters) {
-                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
-                } else {
-                    moduleName = candidateModuleNameInfo.moduleName;
-                }
-            }
-
-            importType = ImportType.Local;
-        }
-
-        for (const extraPath of execEnv.extraPaths) {
-            const candidateModuleNameInfo = this.getModuleNameInfoFromPath(extraPath, filePath);
-
-            if (candidateModuleNameInfo) {
-                if (candidateModuleNameInfo.containsInvalidCharacters) {
-                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
-                } else {
-                    // Does this candidate look better than the previous best module name?
-                    // We'll always try to use the shortest version.
-                    const candidateModuleName = candidateModuleNameInfo.moduleName;
-                    if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
-                        moduleName = candidateModuleName;
-                        importType = ImportType.Local;
-                    }
-                }
-            }
-        }
-
-        // Check for a typings file.
-        if (this._configOptions.stubPath) {
-            const candidateModuleNameInfo = this.getModuleNameInfoFromPath(this._configOptions.stubPath, filePath);
-
-            if (candidateModuleNameInfo) {
-                if (candidateModuleNameInfo.containsInvalidCharacters) {
-                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
-                } else {
-                    // Does this candidate look better than the previous best module name?
-                    // We'll always try to use the shortest version.
-                    const candidateModuleName = candidateModuleNameInfo.moduleName;
-                    if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
-                        moduleName = candidateModuleName;
-
-                        // Treat the typings path as a local import so errors are reported for it.
-                        importType = ImportType.Local;
-                        isLocalTypingsFile = true;
-                    }
-                }
-            }
-        }
-
-        // Check for a typeshed file.
-        const thirdPartyTypeshedPath = this._getThirdPartyTypeshedPath(execEnv, importFailureInfo);
-        if (thirdPartyTypeshedPath) {
-            const candidateModuleName = this.getModuleNameFromPath(
-                thirdPartyTypeshedPath,
-                filePath,
-                /* stripTopContainerDir */ true
-            );
-
-            // Does this candidate look better than the previous best module name?
-            // We'll always try to use the shortest version.
-            if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
-                moduleName = candidateModuleName;
-                importType = ImportType.ThirdParty;
-            }
-        }
-
-        const thirdPartyTypeshedPathEx = this.getTypeshedPathEx(execEnv, importFailureInfo);
-        if (thirdPartyTypeshedPathEx) {
-            const candidateModuleName = this.getModuleNameFromPath(thirdPartyTypeshedPathEx, filePath);
-
-            // Does this candidate look better than the previous best module name?
-            // We'll always try to use the shortest version.
-            if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
-                moduleName = candidateModuleName;
-                importType = ImportType.ThirdParty;
-            }
-        }
-
-        // Look for the import in the list of third-party packages.
-        const pythonSearchPaths = this.getPythonSearchPaths(importFailureInfo);
-
-        for (const searchPath of pythonSearchPaths) {
-            const candidateModuleNameInfo = this.getModuleNameInfoFromPath(searchPath, filePath);
-
-            if (candidateModuleNameInfo) {
-                if (candidateModuleNameInfo.containsInvalidCharacters) {
-                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
-                } else {
-                    // Does this candidate look better than the previous best module name?
-                    // We'll always try to use the shortest version.
-                    const candidateModuleName = candidateModuleNameInfo.moduleName;
-                    if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
-                        moduleName = candidateModuleName;
-                        importType = ImportType.ThirdParty;
-                    }
-                }
-            }
-        }
-
-        if (moduleName) {
-            return { moduleName, importType, isLocalTypingsFile };
-        }
-
-        if (allowInvalidModuleName && moduleNameWithInvalidCharacters) {
-            return { moduleName: moduleNameWithInvalidCharacters, importType, isLocalTypingsFile };
-        }
-
-        // We didn't find any module name.
-        return { moduleName: '', importType: ImportType.Local, isLocalTypingsFile };
+        allowInvalidModuleName = false,
+        detectPyTyped = false
+    ) {
+        // Cache results of the reverse of resolveImport as we cache resolveImport.
+        const cache = getOrAdd(
+            this._cachedModuleNameResults,
+            execEnv.root?.key,
+            () => new Map<string, ModuleImportInfo>()
+        );
+        const key = `${allowInvalidModuleName}.${detectPyTyped}.${fileUri.key}`;
+        return getOrAdd(cache, key, () =>
+            this._getModuleNameForImport(fileUri, execEnv, allowInvalidModuleName, detectPyTyped)
+        );
     }
 
     getTypeshedStdLibPath(execEnv: ExecutionEnvironment) {
         const unused: string[] = [];
-        return this._getStdlibTypeshedPath(execEnv, unused);
+        return this._getStdlibTypeshedPath(
+            this._configOptions.typeshedPath,
+            execEnv.pythonVersion,
+            execEnv.pythonPlatform,
+            unused
+        );
+    }
+
+    getTypeshedThirdPartyPath(execEnv: ExecutionEnvironment) {
+        const unused: string[] = [];
+        return this._getThirdPartyTypeshedPath(this._configOptions.typeshedPath, unused);
     }
 
     isStdlibModule(module: ImportedModuleDescriptor, execEnv: ExecutionEnvironment): boolean {
         if (!this._stdlibModules) {
-            this._stdlibModules = this._buildStdlibCache(this.getTypeshedStdLibPath(execEnv));
+            this._stdlibModules = this._buildStdlibCache(this.getTypeshedStdLibPath(execEnv), execEnv);
         }
 
         return this._stdlibModules.has(module.nameParts.join('.'));
@@ -719,7 +349,12 @@ export class ImportResolver {
         const importFailureInfo: string[] = [];
         const roots = [];
 
-        const stdTypeshed = this._getStdlibTypeshedPath(execEnv, importFailureInfo);
+        const stdTypeshed = this._getStdlibTypeshedPath(
+            this._configOptions.typeshedPath,
+            execEnv.pythonVersion,
+            execEnv.pythonPlatform,
+            importFailureInfo
+        );
         if (stdTypeshed) {
             roots.push(stdTypeshed);
         }
@@ -739,12 +374,12 @@ export class ImportResolver {
             // There's one path for each third party package, which blows up logging.
             // Just get the root directly and show it with `...` to indicate that this
             // is where the third party folder is in the roots.
-            const thirdPartyRoot = this._getThirdPartyTypeshedPath(execEnv, importFailureInfo);
+            const thirdPartyRoot = this._getThirdPartyTypeshedPath(this._configOptions.typeshedPath, importFailureInfo);
             if (thirdPartyRoot) {
-                roots.push(combinePaths(thirdPartyRoot, '...'));
+                roots.push(thirdPartyRoot.resolvePaths('...'));
             }
         } else {
-            const thirdPartyPaths = this._getThirdPartyTypeshedPackageRoots(execEnv, importFailureInfo);
+            const thirdPartyPaths = this._getThirdPartyTypeshedPackageRoots(importFailureInfo);
             appendArray(roots, thirdPartyPaths);
         }
 
@@ -761,42 +396,245 @@ export class ImportResolver {
         return roots;
     }
 
-    protected readdirEntriesCached(path: string): Dirent[] {
-        const cachedValue = this._cachedEntriesForPath.get(path);
+    ensurePartialStubPackages(execEnv: ExecutionEnvironment) {
+        if (!this.partialStubs) {
+            return false;
+        }
+
+        if (this.partialStubs.isPartialStubPackagesScanned(execEnv)) {
+            return false;
+        }
+
+        const ps = this.partialStubs;
+        const ignored: string[] = [];
+        const paths: Uri[] = [];
+        const typeshedPathEx = this.getTypeshedPathEx(execEnv, ignored);
+
+        // Add paths to search stub packages.
+        addPaths(this._configOptions.stubPath);
+        addPaths(execEnv.root ?? this._configOptions.projectRoot);
+        execEnv.extraPaths.forEach((p) => addPaths(p));
+        addPaths(typeshedPathEx);
+        this.getPythonSearchPaths(ignored).forEach((p) => addPaths(p));
+
+        this.partialStubs.processPartialStubPackages(paths, this.getImportRoots(execEnv), typeshedPathEx);
+        this._invalidateFileSystemCache();
+        return true;
+
+        function addPaths(path?: Uri) {
+            if (!path || ps.isPathScanned(path)) {
+                return;
+            }
+
+            paths.push(path);
+        }
+    }
+
+    getPythonSearchPaths(importFailureInfo: string[]): Uri[] {
+        // Find the site packages for the configured virtual environment.
+        if (!this._cachedPythonSearchPaths) {
+            const info: string[] = [];
+            const paths = (
+                PythonPathUtils.findPythonSearchPaths(this.fileSystem, this._configOptions, this.host, info) || []
+            ).map((p) => this.fileSystem.realCasePath(p));
+
+            // Remove duplicates (yes, it happens).
+            this._cachedPythonSearchPaths = { paths: Array.from(new Set(paths)), failureInfo: info };
+        }
+
+        // Make sure we cache the logs as well so we can find out why search path failed.
+        importFailureInfo.push(...this._cachedPythonSearchPaths.failureInfo);
+        return this._cachedPythonSearchPaths.paths;
+    }
+
+    getTypeshedStdlibExcludeList(
+        customTypeshedPath: Uri | undefined,
+        pythonVersion: PythonVersion,
+        pythonPlatform: string | undefined
+    ): Uri[] {
+        const unused: string[] = [];
+        const typeshedStdlibPath = this._getStdlibTypeshedPath(
+            customTypeshedPath,
+            pythonVersion,
+            pythonPlatform,
+            unused
+        );
+        const excludes: Uri[] = [];
+
+        if (!typeshedStdlibPath) {
+            return excludes;
+        }
+
+        if (!this._cachedTypeshedStdLibModuleVersionInfo) {
+            this._cachedTypeshedStdLibModuleVersionInfo = this._readTypeshedStdLibVersions(customTypeshedPath, []);
+        }
+
+        this._cachedTypeshedStdLibModuleVersionInfo.forEach((versionInfo, moduleName) => {
+            let shouldExcludeModule = false;
+
+            if (versionInfo.max !== undefined && PythonVersion.isGreaterThan(pythonVersion, versionInfo.max)) {
+                shouldExcludeModule = true;
+            }
+
+            if (pythonPlatform !== undefined) {
+                const pythonPlatformLower = pythonPlatform.toLowerCase();
+
+                // If there are supported platforms listed, and we are not using one
+                // of those supported platforms, exclude it.
+                if (versionInfo.supportedPlatforms) {
+                    if (versionInfo.supportedPlatforms.every((p) => p.toLowerCase() !== pythonPlatformLower)) {
+                        shouldExcludeModule = true;
+                    }
+                }
+
+                // If there are unsupported platforms listed, see if we're using one of them.
+                if (versionInfo.unsupportedPlatforms) {
+                    if (versionInfo.unsupportedPlatforms.some((p) => p.toLowerCase() === pythonPlatformLower)) {
+                        shouldExcludeModule = true;
+                    }
+                }
+            }
+
+            if (shouldExcludeModule) {
+                // Add excludes for both the ".pyi" file and the directory that contains it
+                // (in case it's using a "__init__.pyi" file).
+                const moduleDirPath = typeshedStdlibPath.combinePaths(...moduleName.split('.'));
+                excludes.push(moduleDirPath);
+
+                const moduleFilePath = moduleDirPath.replaceExtension('.pyi');
+                excludes.push(moduleFilePath);
+            }
+        });
+
+        return excludes;
+    }
+
+    // Intended to be overridden by subclasses to provide additional stub
+    // path capabilities. Return undefined if no extra stub path were found.
+    getTypeshedPathEx(execEnv: ExecutionEnvironment, importFailureInfo: string[]): Uri | undefined {
+        return undefined;
+    }
+
+    protected readdirEntriesCached(uri: Uri): Dirent[] {
+        const cachedValue = this._cachedEntriesForPath.get(uri.key);
         if (cachedValue) {
             return cachedValue;
         }
 
         let newCacheValue: Dirent[];
         try {
-            newCacheValue = this.fileSystem.readdirEntriesSync(path);
+            newCacheValue = this.fileSystem.readdirEntriesSync(uri);
         } catch {
             newCacheValue = [];
         }
 
         // Populate cache for next time.
-        this._cachedEntriesForPath.set(path, newCacheValue);
+        this._cachedEntriesForPath.set(uri.key, newCacheValue);
         return newCacheValue;
     }
 
-    protected fileExistsCached(path: string): boolean {
-        const splitPath = this._splitPath(path);
+    // Resolves the import and returns the path if it exists, otherwise
+    // returns undefined.
+    protected resolveImportInternal(
+        sourceFileUri: Uri,
+        execEnv: ExecutionEnvironment,
+        moduleDescriptor: ImportedModuleDescriptor
+    ): ImportResult {
+        const importName = formatImportName(moduleDescriptor);
+        const importFailureInfo: string[] = [];
+        const importResult = this._resolveImportStrict(
+            importName,
+            sourceFileUri,
+            execEnv,
+            moduleDescriptor,
+            importFailureInfo
+        );
 
-        if (!splitPath[0] || !splitPath[1]) {
-            if (!this.fileSystem.existsSync(path)) {
-                return false;
-            }
-            return tryStat(this.fileSystem, path)?.isFile() ?? false;
+        if (importResult.isImportFound || moduleDescriptor.leadingDots > 0) {
+            return importResult;
         }
 
-        const entries = this.readdirEntriesCached(splitPath[0]);
-        const entry = entries.find((entry) => entry.name === splitPath[1]);
+        // If the import is absolute and no other method works, try resolving the
+        // absolute in the importing file's directory, then the parent directory,
+        // and so on, until the import root is reached.
+        const origin = sourceFileUri.getDirectory();
+
+        const result = this.cachedParentImportResults.getImportResult(origin, importName, importResult);
+        if (result) {
+            // Already ran the parent directory resolution for this import name on this location.
+            return this.filterImplicitImports(result, moduleDescriptor.importedSymbols);
+        }
+
+        // Check whether the given file is in the parent directory import resolution cache.
+        const root = getParentImportResolutionRoot(sourceFileUri, execEnv.root);
+        if (!this.cachedParentImportResults.checkValidPath(this.fileSystem, sourceFileUri, root)) {
+            return importResult;
+        }
+
+        const localImportFailureInfo: string[] = [`Attempting to resolve using local imports: ${importName}`];
+        const importPath: ImportPath = { importPath: undefined };
+
+        // Going up the given folder one by one until we can resolve the import.
+        let current: Uri | undefined = origin;
+        while (this._shouldWalkUp(current, root, execEnv) && current) {
+            const result = this.resolveAbsoluteImport(
+                sourceFileUri,
+                current,
+                execEnv,
+                moduleDescriptor,
+                importName,
+                localImportFailureInfo,
+                /* allowPartial */ undefined,
+                /* allowNativeLib */ undefined,
+                /* useStubPackage */ false,
+                /* allowPyi */ true
+            );
+
+            this.cachedParentImportResults.checked(current!, importName, importPath);
+
+            if (result.isImportFound) {
+                // This will make cache to point to actual path that contains the module we found
+                importPath.importPath = current;
+
+                this.cachedParentImportResults.add({
+                    importResult: result,
+                    path: current,
+                    importName,
+                });
+
+                return this.filterImplicitImports(result, moduleDescriptor.importedSymbols);
+            }
+
+            current = this._tryWalkUp(current);
+        }
+
+        if (current) {
+            this.cachedParentImportResults.checked(current, importName, importPath);
+        }
+
+        if (this._configOptions.verboseOutput) {
+            const console = this.serviceProvider.console();
+            localImportFailureInfo.forEach((diag) => console.log(diag));
+        }
+
+        return importResult;
+    }
+
+    protected fileExistsCached(uri: Uri): boolean {
+        const directory = uri.getDirectory();
+        if (directory.equals(uri)) {
+            // Started at root, so this can't be a file.
+            return false;
+        }
+        const fileName = uri.fileName;
+        const entries = this.readdirEntriesCached(directory);
+        const entry = entries.find((entry) => entry.name === fileName);
         if (entry?.isFile()) {
             return true;
         }
 
         if (entry?.isSymbolicLink()) {
-            const realPath = tryRealpath(this.fileSystem, path);
+            const realPath = tryRealpath(this.fileSystem, uri);
             if (realPath && this.fileSystem.existsSync(realPath) && isFile(this.fileSystem, realPath)) {
                 return true;
             }
@@ -805,24 +643,30 @@ export class ImportResolver {
         return false;
     }
 
-    protected dirExistsCached(path: string): boolean {
-        const splitPath = this._splitPath(path);
-
-        if (!splitPath[0] || !splitPath[1]) {
-            if (!this.fileSystem.existsSync(path)) {
-                return false;
+    protected dirExistsCached(uri: Uri): boolean {
+        const parent = uri.getDirectory();
+        if (parent.equals(uri)) {
+            // Started at root. No entries to read, so have to check ourselves.
+            let cachedExistence = this._cachedDirExistenceForRoot.get(uri.key);
+            // Check if the value was in the cache or not. Undefined means it wasn't.
+            if (cachedExistence === undefined) {
+                cachedExistence = tryStat(this.fileSystem, uri)?.isDirectory() ?? false;
+                this._cachedDirExistenceForRoot.set(uri.key, cachedExistence);
             }
-            return tryStat(this.fileSystem, path)?.isDirectory() ?? false;
+            return cachedExistence;
         }
 
-        const entries = this.readdirEntriesCached(splitPath[0]);
-        const entry = entries.find((entry) => entry.name === splitPath[1]);
+        // Otherwise not a root, so read the entries we have cached to see if
+        // the directory exists or not.
+        const directoryName = uri.fileName;
+        const entries = this.readdirEntriesCached(parent);
+        const entry = entries.find((entry) => entry.name === directoryName);
         if (entry?.isDirectory()) {
             return true;
         }
 
         if (entry?.isSymbolicLink()) {
-            const realPath = tryRealpath(this.fileSystem, path);
+            const realPath = tryRealpath(this.fileSystem, uri);
             if (realPath && this.fileSystem.existsSync(realPath) && isDirectory(this.fileSystem, realPath)) {
                 return true;
             }
@@ -831,58 +675,30 @@ export class ImportResolver {
         return false;
     }
 
-    ensurePartialStubPackages(execEnv: ExecutionEnvironment) {
-        if (!SupportPartialStubs.is(this.fileSystem)) {
-            return false;
-        }
-
-        if (this.fileSystem.isPartialStubPackagesScanned(execEnv)) {
-            return false;
-        }
-
-        const fs = this.fileSystem;
-        const ignored: string[] = [];
-        const paths: string[] = [];
-        const typeshedPathEx = this.getTypeshedPathEx(execEnv, ignored);
-
-        // Add paths to search stub packages.
-        addPaths(this._configOptions.stubPath);
-        addPaths(execEnv.root);
-        execEnv.extraPaths.forEach((p) => addPaths(p));
-        addPaths(typeshedPathEx);
-        this.getPythonSearchPaths(ignored).forEach((p) => addPaths(p));
-
-        this.fileSystem.processPartialStubPackages(paths, this.getImportRoots(execEnv), typeshedPathEx);
-        this._invalidateFileSystemCache();
-        return true;
-
-        function addPaths(path?: string) {
-            if (!path || fs.isPathScanned(path)) {
-                return;
-            }
-
-            paths.push(path);
-        }
-    }
-
     protected addResultsToCache(
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         importName: string,
         importResult: ImportResult,
-        importedSymbols: string[] | undefined
+        moduleDescriptor: ImportedModuleDescriptor | undefined,
+        fromUserFile: boolean
     ) {
-        getOrAdd(this._cachedImportResults, execEnv.root, () => new Map<string, ImportResult>()).set(
-            importName,
+        // If the import is relative, include the source file path in the key.
+        const relativeSourceFileUri = moduleDescriptor && moduleDescriptor.leadingDots > 0 ? sourceFileUri : undefined;
+
+        getOrAdd(this._cachedImportResults, execEnv.root?.key, () => new Map<string, ImportResult>()).set(
+            this._getImportCacheKey(relativeSourceFileUri, importName, fromUserFile),
             importResult
         );
 
-        return this.filterImplicitImports(importResult, importedSymbols);
+        return this.filterImplicitImports(importResult, moduleDescriptor?.importedSymbols);
     }
 
     // Follows import resolution algorithm defined in PEP-420:
     // https://www.python.org/dev/peps/pep-0420/
     protected resolveAbsoluteImport(
-        rootPath: string,
+        sourceFileUri: Uri | undefined,
+        rootPath: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor,
         importName: string,
@@ -934,26 +750,488 @@ export class ImportResolver {
         );
     }
 
-    private _invalidateFileSystemCache() {
-        this._cachedEntriesForPath.clear();
+    // Intended to be overridden by subclasses to provide additional stub
+    // resolving capabilities. Return undefined if no stubs were found for
+    // this import.
+    protected resolveImportEx(
+        sourceFileUri: Uri,
+        execEnv: ExecutionEnvironment,
+        moduleDescriptor: ImportedModuleDescriptor,
+        importName: string,
+        importFailureInfo: string[] = [],
+        allowPyi = true
+    ): ImportResult | undefined {
+        return undefined;
     }
 
-    // Splits a path into the name of the containing directory and
-    // a file or dir within that containing directory.
-    private _splitPath(path: string): [string, string] {
-        const pathComponents = getPathComponents(path);
-        if (pathComponents.length <= 1) {
-            return [path, ''];
+    // Intended to be overridden by subclasses to provide additional stub
+    // resolving capabilities for native (compiled) modules. Returns undefined
+    // if no stubs were found for this import.
+    protected resolveNativeImportEx(
+        libraryFileUri: Uri,
+        importName: string,
+        importFailureInfo: string[] = []
+    ): Uri | undefined {
+        return undefined;
+    }
+
+    protected getNativeModuleName(uri: Uri): string | undefined {
+        const fileExtension = uri.lastExtension.toLowerCase();
+        if (_isNativeModuleFileExtension(fileExtension)) {
+            return stripFileExtension(uri.fileName, /* multiDotExtension */ true);
+        }
+        return undefined;
+    }
+
+    // Potentially modifies the ImportResult by removing some or all of the
+    // implicit import entries. Only the imported symbols should be included.
+    protected filterImplicitImports(
+        importResult: ImportResult,
+        importedSymbols: Set<string> | undefined
+    ): ImportResult {
+        if (importedSymbols === undefined) {
+            const newImportResult = Object.assign({}, importResult);
+            newImportResult.filteredImplicitImports = new Map<string, ImplicitImport>();
+            return newImportResult;
         }
 
-        const containingPath = combinePathComponents(pathComponents.slice(0, -1));
-        const fileOrDirName = pathComponents[pathComponents.length - 1];
+        if (importedSymbols.size === 0) {
+            return importResult;
+        }
 
-        return [containingPath, fileOrDirName];
+        if (importResult.implicitImports.size === 0) {
+            return importResult;
+        }
+
+        const filteredImplicitImports = new Map<string, ImplicitImport>();
+        importResult.implicitImports.forEach((implicitImport) => {
+            if (importedSymbols.has(implicitImport.name)) {
+                filteredImplicitImports.set(implicitImport.name, implicitImport);
+            }
+        });
+
+        if (filteredImplicitImports.size === importResult.implicitImports.size) {
+            return importResult;
+        }
+
+        const newImportResult = Object.assign({}, importResult);
+        newImportResult.filteredImplicitImports = filteredImplicitImports;
+        return newImportResult;
+    }
+
+    private _resolveImportStrict(
+        importName: string,
+        sourceFileUri: Uri,
+        execEnv: ExecutionEnvironment,
+        moduleDescriptor: ImportedModuleDescriptor,
+        importFailureInfo: string[]
+    ) {
+        const fromUserFile = matchFileSpecs(this._configOptions, sourceFileUri);
+        const notFoundResult: ImportResult = {
+            importName,
+            isRelative: false,
+            isImportFound: false,
+            isPartlyResolved: false,
+            isNamespacePackage: false,
+            isInitFilePresent: false,
+            isStubPackage: false,
+            importFailureInfo,
+            resolvedUris: [],
+            importType: ImportType.Local,
+            isStubFile: false,
+            isNativeLib: false,
+            implicitImports: new Map<string, ImplicitImport>(),
+            filteredImplicitImports: new Map<string, ImplicitImport>(),
+            nonStubImportResult: undefined,
+        };
+
+        this.ensurePartialStubPackages(execEnv);
+
+        // Is it a relative import?
+        if (moduleDescriptor.leadingDots > 0) {
+            const cachedResults = this._lookUpResultsInCache(
+                sourceFileUri,
+                execEnv,
+                importName,
+                moduleDescriptor,
+                fromUserFile
+            );
+
+            if (cachedResults) {
+                return cachedResults;
+            }
+
+            const relativeImport = this._resolveRelativeImport(
+                sourceFileUri,
+                execEnv,
+                moduleDescriptor,
+                importName,
+                importFailureInfo
+            );
+
+            if (relativeImport) {
+                relativeImport.isRelative = true;
+
+                return this.addResultsToCache(
+                    sourceFileUri,
+                    execEnv,
+                    importName,
+                    relativeImport,
+                    moduleDescriptor,
+                    fromUserFile
+                );
+            }
+        } else {
+            const cachedResults = this._lookUpResultsInCache(
+                sourceFileUri,
+                execEnv,
+                importName,
+                moduleDescriptor,
+                fromUserFile
+            );
+
+            if (cachedResults) {
+                // In most cases, we can simply return a cached entry. However, there are cases
+                // where the cached entry refers to a previously-resolved namespace package
+                // that does not resolve the symbols specified in the module descriptor.
+                // In this case, we will ignore the cached value and run the full import
+                // resolution again to try to find a package that resolves the import.
+                const isUnresolvedNamespace =
+                    cachedResults.isImportFound &&
+                    cachedResults.isNamespacePackage &&
+                    !this._isNamespacePackageResolved(moduleDescriptor, cachedResults.implicitImports);
+
+                if (!isUnresolvedNamespace) {
+                    return cachedResults;
+                }
+            }
+
+            const bestImport = this._resolveBestAbsoluteImport(
+                sourceFileUri,
+                execEnv,
+                moduleDescriptor,
+                /* allowPyi */ true
+            );
+
+            if (bestImport) {
+                if (bestImport.isStubFile) {
+                    bestImport.nonStubImportResult =
+                        this._resolveBestAbsoluteImport(
+                            sourceFileUri,
+                            execEnv,
+                            moduleDescriptor,
+                            /* allowPyi */ false
+                        ) || notFoundResult;
+                }
+
+                return this.addResultsToCache(
+                    sourceFileUri,
+                    execEnv,
+                    importName,
+                    bestImport,
+                    moduleDescriptor,
+                    fromUserFile
+                );
+            }
+        }
+
+        return this.addResultsToCache(
+            sourceFileUri,
+            execEnv,
+            importName,
+            notFoundResult,
+            /* moduleDescriptor */ undefined,
+            fromUserFile
+        );
+    }
+
+    private _getCompletionSuggestionsStrict(
+        sourceFileUri: Uri,
+        execEnv: ExecutionEnvironment,
+        moduleDescriptor: ImportedModuleDescriptor
+    ): Map<string, Uri> {
+        const importFailureInfo: string[] = [];
+        const suggestions = new Map<string, Uri>();
+
+        // Is it a relative import?
+        if (moduleDescriptor.leadingDots > 0) {
+            this._getCompletionSuggestionsRelative(sourceFileUri, execEnv, moduleDescriptor, suggestions);
+        } else {
+            // First check for a typeshed file.
+            if (moduleDescriptor.nameParts.length > 0) {
+                this._getCompletionSuggestionsTypeshedPath(sourceFileUri, execEnv, moduleDescriptor, true, suggestions);
+            }
+
+            // Look for it in the root directory of the execution environment.
+            if (execEnv.root) {
+                this._getCompletionSuggestionsAbsolute(
+                    sourceFileUri,
+                    execEnv,
+                    execEnv.root,
+                    moduleDescriptor,
+                    suggestions
+                );
+            }
+
+            for (const extraPath of execEnv.extraPaths) {
+                this._getCompletionSuggestionsAbsolute(
+                    sourceFileUri,
+                    execEnv,
+                    extraPath,
+                    moduleDescriptor,
+                    suggestions
+                );
+            }
+
+            // Check for a typings file.
+            if (this._configOptions.stubPath) {
+                this._getCompletionSuggestionsAbsolute(
+                    sourceFileUri,
+                    execEnv,
+                    this._configOptions.stubPath,
+                    moduleDescriptor,
+                    suggestions
+                );
+            }
+
+            // Check for a typeshed file.
+            this._getCompletionSuggestionsTypeshedPath(sourceFileUri, execEnv, moduleDescriptor, false, suggestions);
+
+            // Look for the import in the list of third-party packages.
+            const pythonSearchPaths = this.getPythonSearchPaths(importFailureInfo);
+            for (const searchPath of pythonSearchPaths) {
+                this._getCompletionSuggestionsAbsolute(
+                    sourceFileUri,
+                    execEnv,
+                    searchPath,
+                    moduleDescriptor,
+                    suggestions
+                );
+            }
+        }
+
+        return suggestions;
+    }
+
+    private _getModuleNameForImport(
+        fileUri: Uri,
+        execEnv: ExecutionEnvironment,
+        allowInvalidModuleName: boolean,
+        detectPyTyped: boolean
+    ): ModuleImportInfo {
+        let moduleName: string | undefined;
+        let importType = ImportType.BuiltIn;
+        let isLocalTypingsFile = false;
+        let isThirdPartyPyTypedPresent = false;
+        let isTypeshedFile = false;
+
+        const importFailureInfo: string[] = [];
+
+        // If we cannot find a fully-qualified module name with legal characters,
+        // look for one with invalid characters (e.g. "-"). This is important to
+        // differentiate between different modules in a project in case they
+        // declare types with the same (local) name.
+        let moduleNameWithInvalidCharacters: string | undefined;
+
+        // Is this a stdlib typeshed path?
+        const stdLibTypeshedPath = this._getStdlibTypeshedPath(
+            this._configOptions.typeshedPath,
+            execEnv.pythonVersion,
+            execEnv.pythonPlatform,
+            importFailureInfo
+        );
+
+        if (stdLibTypeshedPath) {
+            moduleName = getModuleNameFromPath(stdLibTypeshedPath, fileUri);
+            if (moduleName) {
+                const moduleDescriptor: ImportedModuleDescriptor = {
+                    leadingDots: 0,
+                    nameParts: moduleName.split('.'),
+                    importedSymbols: undefined,
+                };
+
+                if (
+                    this._isStdlibTypeshedStubValidForVersion(
+                        moduleDescriptor,
+                        this._configOptions.typeshedPath,
+                        execEnv.pythonVersion,
+                        execEnv.pythonPlatform,
+                        []
+                    )
+                ) {
+                    return {
+                        moduleName,
+                        importType,
+                        isTypeshedFile: true,
+                        isLocalTypingsFile,
+                        isThirdPartyPyTypedPresent,
+                    };
+                }
+            }
+        }
+
+        // Look for it in the root directory of the execution environment.
+        if (execEnv.root) {
+            const candidateModuleNameInfo = _getModuleNameInfoFromPath(execEnv.root, fileUri);
+
+            if (candidateModuleNameInfo) {
+                if (candidateModuleNameInfo.containsInvalidCharacters) {
+                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
+                } else {
+                    moduleName = candidateModuleNameInfo.moduleName;
+                }
+            }
+
+            importType = ImportType.Local;
+        }
+
+        for (const extraPath of execEnv.extraPaths) {
+            const candidateModuleNameInfo = _getModuleNameInfoFromPath(extraPath, fileUri);
+
+            if (candidateModuleNameInfo) {
+                if (candidateModuleNameInfo.containsInvalidCharacters) {
+                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
+                } else {
+                    // Does this candidate look better than the previous best module name?
+                    // We'll always try to use the shortest version.
+                    const candidateModuleName = candidateModuleNameInfo.moduleName;
+                    if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
+                        moduleName = candidateModuleName;
+                        importType = ImportType.Local;
+                    }
+                }
+            }
+        }
+
+        // Check for a typings file.
+        if (this._configOptions.stubPath) {
+            const candidateModuleNameInfo = _getModuleNameInfoFromPath(this._configOptions.stubPath, fileUri);
+
+            if (candidateModuleNameInfo) {
+                if (candidateModuleNameInfo.containsInvalidCharacters) {
+                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
+                } else {
+                    // Does this candidate look better than the previous best module name?
+                    // We'll always try to use the shortest version.
+                    const candidateModuleName = candidateModuleNameInfo.moduleName;
+                    if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
+                        moduleName = candidateModuleName;
+
+                        // Treat the typings path as a local import so errors are reported for it.
+                        importType = ImportType.Local;
+                        isLocalTypingsFile = true;
+                    }
+                }
+            }
+        }
+
+        // Check for a typeshed file.
+        const thirdPartyTypeshedPath = this._getThirdPartyTypeshedPath(
+            this._configOptions.typeshedPath,
+            importFailureInfo
+        );
+
+        if (thirdPartyTypeshedPath) {
+            const candidateModuleName = getModuleNameFromPath(
+                thirdPartyTypeshedPath,
+                fileUri,
+                /* stripTopContainerDir */ true
+            );
+
+            // Does this candidate look better than the previous best module name?
+            // We'll always try to use the shortest version.
+            if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
+                moduleName = candidateModuleName;
+                importType = ImportType.ThirdParty;
+                isTypeshedFile = true;
+            }
+        }
+
+        const thirdPartyTypeshedPathEx = this.getTypeshedPathEx(execEnv, importFailureInfo);
+        if (thirdPartyTypeshedPathEx) {
+            const candidateModuleName = getModuleNameFromPath(thirdPartyTypeshedPathEx, fileUri);
+
+            // Does this candidate look better than the previous best module name?
+            // We'll always try to use the shortest version.
+            if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
+                moduleName = candidateModuleName;
+                importType = ImportType.ThirdParty;
+                isTypeshedFile = true;
+            }
+        }
+
+        // Look for the import in the list of third-party packages.
+        const pythonSearchPaths = this.getPythonSearchPaths(importFailureInfo);
+
+        for (const searchPath of pythonSearchPaths) {
+            const candidateModuleNameInfo = _getModuleNameInfoFromPath(searchPath, fileUri);
+
+            if (candidateModuleNameInfo) {
+                if (candidateModuleNameInfo.containsInvalidCharacters) {
+                    moduleNameWithInvalidCharacters = candidateModuleNameInfo.moduleName;
+                } else {
+                    // Does this candidate look better than the previous best module name?
+                    // We'll always try to use the shortest version.
+                    const candidateModuleName = candidateModuleNameInfo.moduleName;
+                    if (!moduleName || (candidateModuleName && candidateModuleName.length < moduleName.length)) {
+                        moduleName = candidateModuleName;
+                        importType = ImportType.ThirdParty;
+                        isTypeshedFile = false;
+                    }
+                }
+            }
+        }
+
+        if (detectPyTyped && importType === ImportType.ThirdParty) {
+            const root = getParentImportResolutionRoot(fileUri, execEnv.root);
+
+            // Go up directories one by one looking for a py.typed file.
+            let current: Uri | undefined = fileUri.getDirectory();
+            while (this._shouldWalkUp(current, root, execEnv)) {
+                const pyTypedInfo = this._getPyTypedInfo(current!);
+                if (pyTypedInfo) {
+                    if (!pyTypedInfo.isPartiallyTyped) {
+                        isThirdPartyPyTypedPresent = true;
+                    }
+                    break;
+                }
+
+                current = this._tryWalkUp(current);
+            }
+        }
+
+        if (moduleName) {
+            return { moduleName, importType, isTypeshedFile, isLocalTypingsFile, isThirdPartyPyTypedPresent };
+        }
+
+        if (allowInvalidModuleName && moduleNameWithInvalidCharacters) {
+            return {
+                moduleName: moduleNameWithInvalidCharacters,
+                isTypeshedFile,
+                importType,
+                isLocalTypingsFile,
+                isThirdPartyPyTypedPresent,
+            };
+        }
+
+        // We didn't find any module name.
+        return {
+            moduleName: '',
+            isTypeshedFile,
+            importType: ImportType.Local,
+            isLocalTypingsFile,
+            isThirdPartyPyTypedPresent,
+        };
+    }
+
+    private _invalidateFileSystemCache() {
+        this._cachedEntriesForPath.clear();
+        this._cachedFilesForPath.clear();
+        this._cachedDirExistenceForRoot.clear();
     }
 
     private _resolveAbsoluteImport(
-        rootPath: string,
+        rootPath: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor,
         importName: string,
@@ -972,22 +1250,21 @@ export class ImportResolver {
 
         // Starting at the specified path, walk the file system to find the
         // specified module.
-        const resolvedPaths: string[] = [];
+        const resolvedPaths: Uri[] = [];
         let dirPath = rootPath;
         let isNamespacePackage = false;
         let isInitFilePresent = false;
         let isStubPackage = false;
         let isStubFile = false;
         let isNativeLib = false;
-        let implicitImports: ImplicitImport[] = [];
-        let packageDirectory: string | undefined;
+        let implicitImports = new Map<string, ImplicitImport>();
+        let packageDirectory: Uri | undefined;
         let pyTypedInfo: PyTypedInfo | undefined;
 
         // Handle the "from . import XXX" case.
         if (moduleDescriptor.nameParts.length === 0) {
-            const fileNameWithoutExtension = '__init__';
-            const pyFilePath = combinePaths(dirPath, fileNameWithoutExtension + '.py');
-            const pyiFilePath = combinePaths(dirPath, fileNameWithoutExtension + '.pyi');
+            const pyFilePath = dirPath.initPyUri;
+            const pyiFilePath = dirPath.initPyiUri;
 
             if (allowPyi && this.fileExistsCached(pyiFilePath)) {
                 importFailureInfo.push(`Resolved import with file '${pyiFilePath}'`);
@@ -998,7 +1275,7 @@ export class ImportResolver {
                 resolvedPaths.push(pyFilePath);
             } else {
                 importFailureInfo.push(`Partially resolved import with directory '${dirPath}'`);
-                resolvedPaths.push('');
+                resolvedPaths.push(Uri.empty());
                 isNamespacePackage = true;
             }
 
@@ -1007,10 +1284,10 @@ export class ImportResolver {
             for (let i = 0; i < moduleDescriptor.nameParts.length; i++) {
                 const isFirstPart = i === 0;
                 const isLastPart = i === moduleDescriptor.nameParts.length - 1;
-                dirPath = combinePaths(dirPath, moduleDescriptor.nameParts[i]);
+                dirPath = dirPath.combinePaths(moduleDescriptor.nameParts[i]);
 
                 if (useStubPackage && isFirstPart) {
-                    dirPath += stubsSuffix;
+                    dirPath = dirPath.addPath(stubsSuffix);
                     isStubPackage = true;
                 }
 
@@ -1022,9 +1299,8 @@ export class ImportResolver {
                     }
 
                     // See if we can find an __init__.py[i] in this directory.
-                    const fileNameWithoutExtension = '__init__';
-                    const pyFilePath = combinePaths(dirPath, fileNameWithoutExtension + '.py');
-                    const pyiFilePath = combinePaths(dirPath, fileNameWithoutExtension + '.pyi');
+                    const pyFilePath = dirPath.initPyUri;
+                    const pyiFilePath = dirPath.initPyiUri;
                     isInitFilePresent = false;
 
                     if (allowPyi && this.fileExistsCached(pyiFilePath)) {
@@ -1041,23 +1317,16 @@ export class ImportResolver {
                     }
 
                     if (!pyTypedInfo && lookForPyTyped) {
-                        if (this.fileExistsCached(combinePaths(dirPath, 'py.typed'))) {
-                            pyTypedInfo = getPyTypedInfo(this.fileSystem, dirPath);
-                        }
-                    }
-
-                    if (!isLastPart) {
-                        // We are not at the last part, and we found a directory,
-                        // so continue to look for the next part.
-                        if (!isInitFilePresent) {
-                            resolvedPaths.push('');
-                            isNamespacePackage = true;
-                            pyTypedInfo = undefined;
-                        }
-                        continue;
+                        pyTypedInfo = this._getPyTypedInfo(dirPath);
                     }
 
                     if (isInitFilePresent) {
+                        if (!isLastPart) {
+                            // We are not at the last part, and we found a directory,
+                            // so continue to look for the next part.
+                            continue;
+                        }
+
                         implicitImports = this._findImplicitImports(moduleDescriptor.nameParts.join('.'), dirPath, [
                             pyFilePath,
                             pyiFilePath,
@@ -1069,11 +1338,9 @@ export class ImportResolver {
                 // We weren't able to find a directory or we found a directory with
                 // no __init__.py[i] file. See if we can find a ".py" or ".pyi" file
                 // with this name.
-                let fileDirectory = stripTrailingDirectorySeparator(dirPath);
-                const fileNameWithoutExtension = getFileName(fileDirectory);
-                fileDirectory = getDirectoryPath(fileDirectory);
-                const pyFilePath = combinePaths(fileDirectory, fileNameWithoutExtension + '.py');
-                const pyiFilePath = combinePaths(fileDirectory, fileNameWithoutExtension + '.pyi');
+                const pyFilePath = dirPath.packageUri;
+                const pyiFilePath = dirPath.packageStubUri;
+                const fileDirectory = dirPath.getDirectory();
 
                 if (allowPyi && this.fileExistsCached(pyiFilePath)) {
                     importFailureInfo.push(`Resolved import with file '${pyiFilePath}'`);
@@ -1084,36 +1351,42 @@ export class ImportResolver {
                 } else if (this.fileExistsCached(pyFilePath)) {
                     importFailureInfo.push(`Resolved import with file '${pyFilePath}'`);
                     resolvedPaths.push(pyFilePath);
-                } else {
-                    if (allowNativeLib && this.dirExistsCached(fileDirectory)) {
-                        const filesInDir = this._getFilesInDirectory(fileDirectory);
-                        const nativeLibFileName = filesInDir.find((f) =>
-                            this._isNativeModuleFileName(fileNameWithoutExtension, f)
-                        );
-                        if (nativeLibFileName) {
-                            const nativeLibPath = combinePaths(fileDirectory, nativeLibFileName);
-                            // Try resolving native library to a custom stub.
-                            isNativeLib = this._resolveNativeModuleStub(
-                                nativeLibPath,
-                                execEnv,
-                                importName,
-                                moduleDescriptor,
-                                importFailureInfo,
-                                resolvedPaths
-                            );
-                        }
+                } else if (
+                    allowNativeLib &&
+                    this._findAndResolveNativeModule(
+                        fileDirectory,
+                        dirPath,
+                        execEnv,
+                        importName,
+                        moduleDescriptor,
+                        importFailureInfo,
+                        resolvedPaths
+                    )
+                ) {
+                    isNativeLib = true;
+                    importFailureInfo.push(`Did not find file '${pyiFilePath}' or '${pyFilePath}'`);
+                } else if (foundDirectory) {
+                    if (!isLastPart) {
+                        // We are not at the last part, and we found a directory,
+                        // so continue to look for the next part assuming this is
+                        // a namespace package.
+                        resolvedPaths.push(Uri.empty());
+                        isNamespacePackage = true;
+                        pyTypedInfo = undefined;
+                        continue;
                     }
 
-                    if (!isNativeLib && foundDirectory) {
-                        importFailureInfo.push(`Partially resolved import with directory '${dirPath}'`);
-                        resolvedPaths.push('');
-                        if (isLastPart) {
-                            implicitImports = this._findImplicitImports(importName, dirPath, [pyFilePath, pyiFilePath]);
-                            isNamespacePackage = true;
-                        }
-                    } else if (isNativeLib) {
-                        importFailureInfo.push(`Did not find file '${pyiFilePath}' or '${pyFilePath}'`);
+                    importFailureInfo.push(`Partially resolved import with directory '${dirPath}'`);
+                    resolvedPaths.push(Uri.empty());
+
+                    if (isLastPart) {
+                        implicitImports = this._findImplicitImports(importName, dirPath, [pyFilePath, pyiFilePath]);
+                        isNamespacePackage = true;
                     }
+                }
+
+                if (!pyTypedInfo && lookForPyTyped) {
+                    pyTypedInfo = this._getPyTypedInfo(fileDirectory);
                 }
                 break;
             }
@@ -1137,7 +1410,7 @@ export class ImportResolver {
             isPartlyResolved,
             importFailureInfo,
             importType: ImportType.Local,
-            resolvedPaths,
+            resolvedUris: resolvedPaths,
             searchPath: rootPath,
             isStubFile,
             isNativeLib,
@@ -1148,61 +1421,34 @@ export class ImportResolver {
         };
     }
 
-    // Intended to be overridden by subclasses to provide additional stub
-    // path capabilities. Return undefined if no extra stub path were found.
-    protected getTypeshedPathEx(execEnv: ExecutionEnvironment, importFailureInfo: string[]): string | undefined {
-        return undefined;
-    }
-
-    // Intended to be overridden by subclasses to provide additional stub
-    // resolving capabilities. Return undefined if no stubs were found for
-    // this import.
-    protected resolveImportEx(
-        sourceFilePath: string,
-        execEnv: ExecutionEnvironment,
-        moduleDescriptor: ImportedModuleDescriptor,
-        importName: string,
-        importFailureInfo: string[] = [],
-        allowPyi = true
-    ): ImportResult | undefined {
-        return undefined;
-    }
-
-    // Intended to be overridden by subclasses to provide additional stub
-    // resolving capabilities for native (compiled) modules. Returns undefined
-    // if no stubs were found for this import.
-    protected resolveNativeImportEx(
-        libraryFilePath: string,
-        importName: string,
-        importFailureInfo: string[] = []
-    ): string | undefined {
-        return undefined;
-    }
-
-    protected getNativeModuleName(fileName: string): string | undefined {
-        const fileExtension = getFileExtension(fileName, /* multiDotExtension */ false).toLowerCase();
-        if (this._isNativeModuleFileExtension(fileExtension)) {
-            return stripFileExtension(stripFileExtension(fileName));
-        }
-        return undefined;
+    private _getImportCacheKey(sourceFileUri: Uri | undefined, importName: string, fromUserFile: boolean) {
+        return `${sourceFileUri?.key ?? ''}-${importName}-${fromUserFile}`;
     }
 
     private _lookUpResultsInCache(
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         importName: string,
-        importedSymbols: string[] | undefined
+        moduleDescriptor: ImportedModuleDescriptor,
+        fromUserFile: boolean
     ) {
-        const cacheForExecEnv = this._cachedImportResults.get(execEnv.root);
+        const cacheForExecEnv = this._cachedImportResults.get(execEnv.root?.key ?? '');
         if (!cacheForExecEnv) {
             return undefined;
         }
 
-        const cachedEntry = cacheForExecEnv.get(importName);
+        // If the import is relative, include the source file path in the key.
+        const relativeSourceFileUri = moduleDescriptor.leadingDots > 0 ? sourceFileUri : undefined;
+
+        const cachedEntry = cacheForExecEnv.get(
+            this._getImportCacheKey(relativeSourceFileUri, importName, fromUserFile)
+        );
+
         if (!cachedEntry) {
             return undefined;
         }
 
-        return this.filterImplicitImports(cachedEntry, importedSymbols);
+        return this.filterImplicitImports(cachedEntry, moduleDescriptor.importedSymbols);
     }
 
     // Determines whether a namespace package resolves all of the symbols
@@ -1210,101 +1456,34 @@ export class ImportResolver {
     // file, so the only way that symbols can be resolved is if submodules
     // are present. If specific symbols were requested, make sure they
     // are all satisfied by submodules (as listed in the implicit imports).
-    private _isNamespacePackageResolved(moduleDescriptor: ImportedModuleDescriptor, implicitImports: ImplicitImport[]) {
+    private _isNamespacePackageResolved(
+        moduleDescriptor: ImportedModuleDescriptor,
+        implicitImports: Map<string, ImplicitImport>
+    ) {
         if (moduleDescriptor.importedSymbols) {
-            if (
-                !moduleDescriptor.importedSymbols.some((symbol) => {
-                    return implicitImports.some((implicitImport) => {
-                        return implicitImport.name === symbol;
-                    });
-                })
-            ) {
+            if (!Array.from(moduleDescriptor.importedSymbols.keys()).some((symbol) => implicitImports.has(symbol))) {
                 return false;
             }
-        } else if (implicitImports.length === 0) {
+        } else if (implicitImports.size === 0) {
             return false;
         }
         return true;
     }
 
-    protected getModuleNameFromPath(
-        containerPath: string,
-        filePath: string,
-        stripTopContainerDir = false
-    ): string | undefined {
-        const moduleNameInfo = this.getModuleNameInfoFromPath(containerPath, filePath, stripTopContainerDir);
-        if (!moduleNameInfo || moduleNameInfo.containsInvalidCharacters) {
-            return undefined;
-        }
-
-        return moduleNameInfo.moduleName;
-    }
-
-    protected getModuleNameInfoFromPath(
-        containerPath: string,
-        filePath: string,
-        stripTopContainerDir = false
-    ): ModuleNameInfoFromPath | undefined {
-        containerPath = ensureTrailingDirectorySeparator(containerPath);
-        let filePathWithoutExtension = stripFileExtension(filePath);
-
-        // If module is native, strip platform part, such as 'cp36-win_amd64' in 'mtrand.cp36-win_amd64'.
-        if (this._isNativeModuleFileExtension(getFileExtension(filePath))) {
-            filePathWithoutExtension = stripFileExtension(filePathWithoutExtension);
-        }
-
-        if (!filePathWithoutExtension.startsWith(containerPath)) {
-            return undefined;
-        }
-
-        // Strip off the '/__init__' if it's present.
-        if (filePathWithoutExtension.endsWith('__init__')) {
-            filePathWithoutExtension = filePathWithoutExtension.substr(0, filePathWithoutExtension.length - 9);
-        }
-
-        const relativeFilePath = filePathWithoutExtension.substr(containerPath.length);
-        const parts = getPathComponents(relativeFilePath);
-        parts.shift();
-        if (stripTopContainerDir) {
-            if (parts.length === 0) {
-                return undefined;
-            }
-            parts.shift();
-        }
-
-        if (parts.length === 0) {
-            return undefined;
-        }
-
-        // Handle the case where the symbol was resolved to a stubs package
-        // rather than the real package. We'll strip off the "-stubs" suffix
-        // in this case.
-        if (parts[0].endsWith(stubsSuffix)) {
-            parts[0] = parts[0].substr(0, parts[0].length - stubsSuffix.length);
-        }
-
-        // Check whether parts contains invalid characters.
-        const containsInvalidCharacters = parts.some((p) => !this._isIdentifier(p));
-
-        return {
-            moduleName: parts.join('.'),
-            containsInvalidCharacters,
-        };
-    }
-
     private _resolveBestAbsoluteImport(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor,
         allowPyi: boolean
     ): ImportResult | undefined {
-        const importName = this.formatImportName(moduleDescriptor);
+        const importName = formatImportName(moduleDescriptor);
         const importFailureInfo: string[] = [];
 
         // Check for a local stub file using stubPath.
         if (allowPyi && this._configOptions.stubPath) {
             importFailureInfo.push(`Looking in stubPath '${this._configOptions.stubPath}'`);
             const typingsImport = this.resolveAbsoluteImport(
+                sourceFileUri,
                 this._configOptions.stubPath,
                 execEnv,
                 moduleDescriptor,
@@ -1327,7 +1506,7 @@ export class ImportResolver {
                 // skip the typings import and continue searching.
                 if (
                     typingsImport.isNamespacePackage &&
-                    !typingsImport.resolvedPaths[typingsImport.resolvedPaths.length - 1]
+                    typingsImport.resolvedUris[typingsImport.resolvedUris.length - 1].isEmpty()
                 ) {
                     if (this._isNamespacePackageResolved(moduleDescriptor, typingsImport.implicitImports)) {
                         return typingsImport;
@@ -1346,6 +1525,7 @@ export class ImportResolver {
             importFailureInfo.push(`Looking in root directory of execution environment ` + `'${execEnv.root}'`);
 
             localImport = this.resolveAbsoluteImport(
+                sourceFileUri,
                 execEnv.root,
                 execEnv,
                 moduleDescriptor,
@@ -1363,6 +1543,7 @@ export class ImportResolver {
         for (const extraPath of execEnv.extraPaths) {
             importFailureInfo.push(`Looking in extraPath '${extraPath}'`);
             localImport = this.resolveAbsoluteImport(
+                sourceFileUri,
                 extraPath,
                 execEnv,
                 moduleDescriptor,
@@ -1377,6 +1558,23 @@ export class ImportResolver {
             bestResultSoFar = this._pickBestImport(bestResultSoFar, localImport, moduleDescriptor);
         }
 
+        // Check for a stdlib typeshed file.
+        if (allowPyi && moduleDescriptor.nameParts.length > 0) {
+            importFailureInfo.push(`Looking for typeshed stdlib path`);
+            const typeshedStdlibImport = this._findTypeshedPath(
+                execEnv,
+                moduleDescriptor,
+                importName,
+                /* isStdLib */ true,
+                importFailureInfo
+            );
+
+            if (typeshedStdlibImport) {
+                typeshedStdlibImport.isStdlibTypeshedFile = true;
+                return typeshedStdlibImport;
+            }
+        }
+
         // Look for the import in the list of third-party packages.
         const pythonSearchPaths = this.getPythonSearchPaths(importFailureInfo);
         if (pythonSearchPaths.length > 0) {
@@ -1384,6 +1582,7 @@ export class ImportResolver {
                 importFailureInfo.push(`Looking in python search path '${searchPath}'`);
 
                 const thirdPartyImport = this.resolveAbsoluteImport(
+                    sourceFileUri,
                     searchPath,
                     execEnv,
                     moduleDescriptor,
@@ -1409,7 +1608,7 @@ export class ImportResolver {
         // If a library is fully py.typed, then we have found the best match,
         // unless the execution environment is typeshed itself, in which case
         // we don't want to favor py.typed libraries. Use the typeshed lookup below.
-        if (execEnv.root !== this._getTypeshedRoot(execEnv, importFailureInfo)) {
+        if (execEnv.root !== this._getTypeshedRoot(this._configOptions.typeshedPath, importFailureInfo)) {
             if (bestResultSoFar?.pyTypedInfo && !bestResultSoFar.isPartlyResolved) {
                 return bestResultSoFar;
             }
@@ -1417,7 +1616,7 @@ export class ImportResolver {
 
         // Call the extensibility hook for subclasses.
         const extraResults = this.resolveImportEx(
-            sourceFilePath,
+            sourceFileUri,
             execEnv,
             moduleDescriptor,
             importName,
@@ -1429,23 +1628,8 @@ export class ImportResolver {
             return extraResults;
         }
 
+        // Check for a third-party typeshed file.
         if (allowPyi && moduleDescriptor.nameParts.length > 0) {
-            // Check for a stdlib typeshed file.
-            importFailureInfo.push(`Looking for typeshed stdlib path`);
-            const typeshedStdlibImport = this._findTypeshedPath(
-                execEnv,
-                moduleDescriptor,
-                importName,
-                /* isStdLib */ true,
-                importFailureInfo
-            );
-
-            if (typeshedStdlibImport) {
-                typeshedStdlibImport.isStdlibTypeshedFile = true;
-                return typeshedStdlibImport;
-            }
-
-            // Check for a third-party typeshed file.
             importFailureInfo.push(`Looking for typeshed third-party path`);
             const typeshedImport = this._findTypeshedPath(
                 execEnv,
@@ -1480,47 +1664,55 @@ export class ImportResolver {
         }
 
         if (newImport.isImportFound) {
+            // Prefer traditional packages over namespace packages.
+            const soFarIndex = bestImportSoFar.resolvedUris.findIndex((path) => !path.isEmpty());
+            const newIndex = newImport.resolvedUris.findIndex((path) => !path.isEmpty());
+            if (soFarIndex !== newIndex) {
+                if (soFarIndex < 0) {
+                    return newImport;
+                } else if (newIndex < 0) {
+                    return bestImportSoFar;
+                }
+                return soFarIndex < newIndex ? bestImportSoFar : newImport;
+            }
+
             // Prefer found over not found.
             if (!bestImportSoFar.isImportFound) {
                 return newImport;
             }
 
-            // Prefer traditional over namespace imports.
-            if (bestImportSoFar.isNamespacePackage && !newImport.isNamespacePackage) {
-                return newImport;
-            }
-
-            // Prefer local packages.
-            if (bestImportSoFar.importType === ImportType.Local && !bestImportSoFar.isNamespacePackage) {
-                return bestImportSoFar;
-            }
-
             // If both are namespace imports, select the one that resolves the symbols.
-            if (
-                bestImportSoFar.isNamespacePackage &&
-                newImport.isNamespacePackage &&
-                moduleDescriptor.importedSymbols
-            ) {
-                if (!this._isNamespacePackageResolved(moduleDescriptor, bestImportSoFar.implicitImports)) {
-                    if (this._isNamespacePackageResolved(moduleDescriptor, newImport.implicitImports)) {
-                        return newImport;
-                    }
+            if (bestImportSoFar.isNamespacePackage && newImport.isNamespacePackage) {
+                if (moduleDescriptor.importedSymbols) {
+                    if (!this._isNamespacePackageResolved(moduleDescriptor, bestImportSoFar.implicitImports)) {
+                        if (this._isNamespacePackageResolved(moduleDescriptor, newImport.implicitImports)) {
+                            return newImport;
+                        }
 
-                    // Prefer the namespace package that has an __init__.py(i) file present
-                    // in the final directory over one that does not.
-                    if (bestImportSoFar.isInitFilePresent && !newImport.isInitFilePresent) {
-                        return bestImportSoFar;
-                    } else if (!bestImportSoFar.isInitFilePresent && newImport.isInitFilePresent) {
-                        return newImport;
+                        // Prefer the namespace package that has an __init__.py(i) file present
+                        // in the final directory over one that does not.
+                        if (bestImportSoFar.isInitFilePresent && !newImport.isInitFilePresent) {
+                            return bestImportSoFar;
+                        } else if (!bestImportSoFar.isInitFilePresent && newImport.isInitFilePresent) {
+                            return newImport;
+                        }
                     }
                 }
+            }
+
+            // Prefer local over third-party. We check local first, so we should never
+            // see the reverse.
+            if (bestImportSoFar.importType === ImportType.Local && newImport.importType === ImportType.ThirdParty) {
+                return bestImportSoFar;
             }
 
             // Prefer py.typed over non-py.typed.
             if (bestImportSoFar.pyTypedInfo && !newImport.pyTypedInfo) {
                 return bestImportSoFar;
             } else if (!bestImportSoFar.pyTypedInfo && newImport.pyTypedInfo) {
-                return newImport;
+                if (bestImportSoFar.importType === newImport.importType) {
+                    return newImport;
+                }
             }
 
             // Prefer pyi over py.
@@ -1531,45 +1723,33 @@ export class ImportResolver {
             }
 
             // All else equal, prefer shorter resolution paths.
-            if (bestImportSoFar.resolvedPaths.length > newImport.resolvedPaths.length) {
+            if (bestImportSoFar.resolvedUris.length > newImport.resolvedUris.length) {
                 return newImport;
             }
-        } else if (newImport.isPartlyResolved && bestImportSoFar.isNamespacePackage && !newImport.isNamespacePackage) {
-            // Always prefer a traditional over namespace import even
-            // if the traditional import is only partly resolved.
-            return newImport;
+        } else if (newImport.isPartlyResolved) {
+            // If the new import is a traditional package but only partly resolves
+            // the import but the best import so far is a namespace package, we need
+            // to consider whether the best import so far also resolves the first part
+            // of the import with a traditional package. Using the example "import a.b.c.d"
+            // and the symbol ~ to represent a namespace package, consider the following
+            // cases:
+            //  bestSoFar: a/~b/~c/~d   new: a      Result: bestSoFar wins
+            //  bestSoFar: ~a/~b/~c/~d  new: a      Result: new wins
+            //  bestSoFar: a/~b/~c/~d   new: a/b    Result: new wins
+            const soFarIndex = bestImportSoFar.resolvedUris.findIndex((path) => !path.isEmpty());
+            const newIndex = newImport.resolvedUris.findIndex((path) => !path.isEmpty());
+
+            if (soFarIndex !== newIndex) {
+                if (soFarIndex < 0) {
+                    return newImport;
+                } else if (newIndex < 0) {
+                    return bestImportSoFar;
+                }
+                return soFarIndex < newIndex ? bestImportSoFar : newImport;
+            }
         }
 
         return bestImportSoFar;
-    }
-
-    private _isIdentifier(value: string) {
-        for (let i = 0; i < value.length; i++) {
-            if (i === 0 ? !isIdentifierStartChar(value.charCodeAt(i)) : !isIdentifierChar(value.charCodeAt(i))) {
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    protected getPythonSearchPaths(importFailureInfo: string[]) {
-        // Find the site packages for the configured virtual environment.
-        if (!this._cachedPythonSearchPaths) {
-            const paths = (
-                PythonPathUtils.findPythonSearchPaths(
-                    this.fileSystem,
-                    this._configOptions,
-                    this.host,
-                    importFailureInfo
-                ) || []
-            ).map((p) => this.fileSystem.realCasePath(p));
-
-            // Remove duplicates (yes, it happens).
-            this._cachedPythonSearchPaths = [...new Set(paths)];
-        }
-
-        return this._cachedPythonSearchPaths;
     }
 
     private _findTypeshedPath(
@@ -1585,20 +1765,28 @@ export class ImportResolver {
             } path`
         );
 
-        let typeshedPaths: string[] | undefined;
+        let typeshedPaths: Uri[] | undefined;
         if (isStdLib) {
-            const path = this._getStdlibTypeshedPath(execEnv, importFailureInfo, moduleDescriptor);
+            const path = this._getStdlibTypeshedPath(
+                this._configOptions.typeshedPath,
+                execEnv.pythonVersion,
+                execEnv.pythonPlatform,
+                importFailureInfo,
+                moduleDescriptor
+            );
+
             if (path) {
                 typeshedPaths = [path];
             }
         } else {
-            typeshedPaths = this._getThirdPartyTypeshedPackagePaths(moduleDescriptor, execEnv, importFailureInfo);
+            typeshedPaths = this._getThirdPartyTypeshedPackagePaths(moduleDescriptor, importFailureInfo);
         }
 
         if (typeshedPaths) {
             for (const typeshedPath of typeshedPaths) {
                 if (this.dirExistsCached(typeshedPath)) {
                     const importInfo = this.resolveAbsoluteImport(
+                        undefined,
                         typeshedPath,
                         execEnv,
                         moduleDescriptor,
@@ -1607,7 +1795,15 @@ export class ImportResolver {
                     );
 
                     if (importInfo.isImportFound) {
-                        importInfo.importType = isStdLib ? ImportType.BuiltIn : ImportType.ThirdParty;
+                        let importType = isStdLib ? ImportType.BuiltIn : ImportType.ThirdParty;
+
+                        // Handle 'typing_extensions' as a special case because it's
+                        // part of stdlib typeshed stubs, but it's not part of stdlib.
+                        if (importName === 'typing_extensions') {
+                            importType = ImportType.ThirdParty;
+                        }
+
+                        importInfo.importType = importType;
                         return importInfo;
                     }
                 }
@@ -1619,20 +1815,30 @@ export class ImportResolver {
     }
 
     // Finds all of the stdlib modules and returns a Set containing all of their names.
-    private _buildStdlibCache(stdlibRoot: string | undefined): Set<string> {
+    private _buildStdlibCache(stdlibRoot: Uri | undefined, executionEnvironment: ExecutionEnvironment): Set<string> {
         const cache = new Set<string>();
 
         if (stdlibRoot) {
-            const readDir = (root: string, prefix: string | undefined) => {
+            const readDir = (root: Uri, prefix: string | undefined) => {
                 this.readdirEntriesCached(root).forEach((entry) => {
                     if (entry.isDirectory()) {
-                        const dirRoot = combinePaths(root, entry.name);
+                        const dirRoot = root.combinePaths(entry.name);
                         readDir(dirRoot, prefix ? `${prefix}.${entry.name}` : entry.name);
                     } else if (entry.name.includes('.py')) {
                         const stripped = stripFileExtension(entry.name);
                         // Skip anything starting with an underscore.
                         if (!stripped.startsWith('_')) {
-                            cache.add(prefix ? `${prefix}.${stripped}` : stripped);
+                            if (
+                                this._isStdlibTypeshedStubValidForVersion(
+                                    createImportedModuleDescriptor(stripped),
+                                    root,
+                                    executionEnvironment.pythonVersion,
+                                    executionEnvironment.pythonPlatform,
+                                    []
+                                )
+                            ) {
+                                cache.add(prefix ? `${prefix}.${stripped}` : stripped);
+                            }
                         }
                     }
                 });
@@ -1648,13 +1854,13 @@ export class ImportResolver {
     // the pypi-registered name of the package and an inner directory contains
     // the name of the package as it is referenced by import statements. These
     // don't always match.
-    private _buildTypeshedThirdPartyPackageMap(thirdPartyDir: string | undefined) {
-        this._cachedTypeshedThirdPartyPackagePaths = new Map<string, string[]>();
+    private _buildTypeshedThirdPartyPackageMap(thirdPartyDir: Uri | undefined) {
+        this._cachedTypeshedThirdPartyPackagePaths = new Map<string, Uri[]>();
 
         if (thirdPartyDir) {
             this.readdirEntriesCached(thirdPartyDir).forEach((outerEntry) => {
                 if (outerEntry.isDirectory()) {
-                    const innerDirPath = combinePaths(thirdPartyDir, outerEntry.name);
+                    const innerDirPath = thirdPartyDir.combinePaths(outerEntry.name);
 
                     this.readdirEntriesCached(innerDirPath).forEach((innerEntry) => {
                         if (innerEntry.name === '@python2') {
@@ -1684,29 +1890,34 @@ export class ImportResolver {
             });
         }
 
-        const flattenPaths = [...this._cachedTypeshedThirdPartyPackagePaths.values()].flatMap((v) => v);
-        this._cachedTypeshedThirdPartyPackageRoots = [...new Set(flattenPaths)].sort();
+        const flattenPaths = Array.from(this._cachedTypeshedThirdPartyPackagePaths.values()).flatMap((v) => v);
+        this._cachedTypeshedThirdPartyPackageRoots = Array.from(new Set(flattenPaths)).sort();
     }
 
     private _getCompletionSuggestionsTypeshedPath(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor,
         isStdLib: boolean,
-        suggestions: Set<string>
+        suggestions: Map<string, Uri>
     ) {
         const importFailureInfo: string[] = [];
 
-        let typeshedPaths: string[] | undefined;
+        let typeshedPaths: Uri[] | undefined;
         if (isStdLib) {
-            const path = this._getStdlibTypeshedPath(execEnv, importFailureInfo, moduleDescriptor);
+            const path = this._getStdlibTypeshedPath(
+                this._configOptions.typeshedPath,
+                execEnv.pythonVersion,
+                execEnv.pythonPlatform,
+                importFailureInfo,
+                moduleDescriptor
+            );
             if (path) {
                 typeshedPaths = [path];
             }
         } else {
             typeshedPaths = this._getThirdPartyTypeshedPackagePaths(
                 moduleDescriptor,
-                execEnv,
                 importFailureInfo,
                 /* includeMatchOnly */ false
             );
@@ -1725,7 +1936,7 @@ export class ImportResolver {
         typeshedPaths.forEach((typeshedPath) => {
             if (this.dirExistsCached(typeshedPath)) {
                 this._getCompletionSuggestionsAbsolute(
-                    sourceFilePath,
+                    sourceFileUri,
                     execEnv,
                     typeshedPath,
                     moduleDescriptor,
@@ -1739,15 +1950,23 @@ export class ImportResolver {
     // If moduleDescriptor is provided, it is filtered based on the VERSIONS
     // file in the typeshed stubs.
     private _getStdlibTypeshedPath(
-        execEnv: ExecutionEnvironment,
+        customTypeshedPath: Uri | undefined,
+        pythonVersion: PythonVersion,
+        pythonPlatform: string | undefined,
         importFailureInfo: string[],
         moduleDescriptor?: ImportedModuleDescriptor
     ) {
-        const subdirectory = this._getTypeshedSubdirectory(/* isStdLib */ true, execEnv, importFailureInfo);
+        const subdirectory = this._getTypeshedSubdirectory(/* isStdLib */ true, customTypeshedPath, importFailureInfo);
         if (
             subdirectory &&
             moduleDescriptor &&
-            !this._isStdlibTypeshedStubValidForVersion(moduleDescriptor, execEnv, importFailureInfo)
+            !this._isStdlibTypeshedStubValidForVersion(
+                moduleDescriptor,
+                customTypeshedPath,
+                pythonVersion,
+                pythonPlatform,
+                importFailureInfo
+            )
         ) {
             return undefined;
         }
@@ -1755,31 +1974,53 @@ export class ImportResolver {
         return subdirectory;
     }
 
-    private _getThirdPartyTypeshedPath(execEnv: ExecutionEnvironment, importFailureInfo: string[]) {
-        return this._getTypeshedSubdirectory(/* isStdLib */ false, execEnv, importFailureInfo);
+    private _getThirdPartyTypeshedPath(customTypeshedPath: Uri | undefined, importFailureInfo: string[]) {
+        return this._getTypeshedSubdirectory(/* isStdLib */ false, customTypeshedPath, importFailureInfo);
     }
 
     private _isStdlibTypeshedStubValidForVersion(
         moduleDescriptor: ImportedModuleDescriptor,
-        execEnv: ExecutionEnvironment,
+        customTypeshedPath: Uri | undefined,
+        pythonVersion: PythonVersion,
+        pythonPlatform: string | undefined,
         importFailureInfo: string[]
     ) {
-        if (!this._cachedTypeshedStdLibModuleVersions) {
-            this._cachedTypeshedStdLibModuleVersions = this._readTypeshedStdLibVersions(execEnv, importFailureInfo);
+        if (!this._cachedTypeshedStdLibModuleVersionInfo) {
+            this._cachedTypeshedStdLibModuleVersionInfo = this._readTypeshedStdLibVersions(
+                customTypeshedPath,
+                importFailureInfo
+            );
         }
 
         // Loop through the name parts to make sure the module and submodules
         // referenced in the import statement are valid for this version of Python.
         for (let namePartCount = 1; namePartCount <= moduleDescriptor.nameParts.length; namePartCount++) {
             const namePartsToConsider = moduleDescriptor.nameParts.slice(0, namePartCount);
-            const versionRange = this._cachedTypeshedStdLibModuleVersions.get(namePartsToConsider.join('.'));
-            if (versionRange) {
-                if (execEnv.pythonVersion < versionRange.min) {
+            const versionInfo = this._cachedTypeshedStdLibModuleVersionInfo.get(namePartsToConsider.join('.'));
+
+            if (versionInfo) {
+                if (PythonVersion.isLessThan(pythonVersion, versionInfo.min)) {
                     return false;
                 }
 
-                if (versionRange.max !== undefined && execEnv.pythonVersion > versionRange.max) {
+                if (versionInfo.max !== undefined && PythonVersion.isGreaterThan(pythonVersion, versionInfo.max)) {
                     return false;
+                }
+
+                if (pythonPlatform !== undefined) {
+                    const pythonPlatformLower = pythonPlatform.toLowerCase();
+
+                    if (versionInfo.supportedPlatforms) {
+                        if (versionInfo.supportedPlatforms.every((p) => p.toLowerCase() !== pythonPlatformLower)) {
+                            return false;
+                        }
+                    }
+
+                    if (versionInfo.unsupportedPlatforms) {
+                        if (versionInfo.unsupportedPlatforms.some((p) => p.toLowerCase() === pythonPlatformLower)) {
+                            return false;
+                        }
+                    }
                 }
             }
         }
@@ -1788,23 +2029,32 @@ export class ImportResolver {
     }
 
     private _readTypeshedStdLibVersions(
-        execEnv: ExecutionEnvironment,
+        customTypeshedPath: Uri | undefined,
         importFailureInfo: string[]
-    ): Map<string, SupportedVersionRange> {
-        const versionRangeMap = new Map<string, SupportedVersionRange>();
+    ): Map<string, SupportedVersionInfo> {
+        const versionRangeMap = new Map<string, SupportedVersionInfo>();
 
         // Read the VERSIONS file from typeshed.
-        const typeshedStdLibPath = this._getTypeshedSubdirectory(/* isStdLib */ true, execEnv, importFailureInfo);
+        const typeshedStdLibPath = this._getTypeshedSubdirectory(
+            /* isStdLib */ true,
+            customTypeshedPath,
+            importFailureInfo
+        );
 
         if (typeshedStdLibPath) {
-            const versionsFilePath = combinePaths(typeshedStdLibPath, 'VERSIONS');
+            const versionsFilePath = typeshedStdLibPath.combinePaths('VERSIONS');
             try {
                 const fileStats = this.fileSystem.statSync(versionsFilePath);
                 if (fileStats.size > 0 && fileStats.size < 256 * 1024) {
                     const fileContents = this.fileSystem.readFileSync(versionsFilePath, 'utf8');
                     fileContents.split(/\r?\n/).forEach((line) => {
                         const commentSplit = line.split('#');
-                        const colonSplit = commentSplit[0].split(':');
+
+                        // Platform-specific information can be specified after a semicolon.
+                        const semicolonSplit = commentSplit[0].split(';').map((s) => s.trim());
+
+                        // Version information is found after a colon.
+                        const colonSplit = semicolonSplit[0].split(':');
                         if (colonSplit.length !== 2) {
                             return;
                         }
@@ -1824,17 +2074,53 @@ export class ImportResolver {
                             // If the version ends in "+", strip it off.
                             minVersionString = minVersionString.substr(0, minVersionString.length - 1);
                         }
-                        let minVersion = versionFromString(minVersionString);
+                        let minVersion = PythonVersion.fromString(minVersionString);
                         if (!minVersion) {
-                            minVersion = PythonVersion.V3_0;
+                            minVersion = pythonVersion3_0;
                         }
 
                         let maxVersion: PythonVersion | undefined;
                         if (versionSplit.length > 1) {
-                            maxVersion = versionFromString(versionSplit[1].trim());
+                            maxVersion = PythonVersion.fromString(versionSplit[1].trim());
                         }
 
-                        versionRangeMap.set(moduleName, { min: minVersion, max: maxVersion });
+                        // A semicolon can be followed by a semicolon-delimited list of other
+                        // exclusions. The "platform" exclusion is a comma delimited list platforms
+                        // that are supported or not supported.
+                        let supportedPlatforms: string[] | undefined;
+                        let unsupportedPlatforms: string[] | undefined;
+                        const platformsHeader = 'platforms=';
+                        let platformExclusions = semicolonSplit.slice(1).find((s) => s.startsWith(platformsHeader));
+
+                        if (platformExclusions) {
+                            platformExclusions = platformExclusions.trim().substring(platformsHeader.length);
+                            const commaSplit = platformExclusions.split(',');
+                            for (let platform of commaSplit) {
+                                platform = platform.trim();
+                                let isUnsupported = false;
+
+                                // Remove the '!' from the start if it's an exclusion.
+                                if (platform.startsWith('!')) {
+                                    isUnsupported = true;
+                                    platform = platform.substring(1);
+                                }
+
+                                if (isUnsupported) {
+                                    unsupportedPlatforms = unsupportedPlatforms ?? [];
+                                    unsupportedPlatforms.push(platform);
+                                } else {
+                                    supportedPlatforms = supportedPlatforms ?? [];
+                                    supportedPlatforms.push(platform);
+                                }
+                            }
+                        }
+
+                        versionRangeMap.set(moduleName, {
+                            min: minVersion,
+                            max: maxVersion,
+                            supportedPlatforms,
+                            unsupportedPlatforms,
+                        });
                     });
                 } else {
                     importFailureInfo.push(`Typeshed stdlib VERSIONS file is unexpectedly large`);
@@ -1849,11 +2135,10 @@ export class ImportResolver {
 
     private _getThirdPartyTypeshedPackagePaths(
         moduleDescriptor: ImportedModuleDescriptor,
-        execEnv: ExecutionEnvironment,
         importFailureInfo: string[],
         includeMatchOnly = true
-    ): string[] | undefined {
-        const typeshedPath = this._getThirdPartyTypeshedPath(execEnv, importFailureInfo);
+    ): Uri[] | undefined {
+        const typeshedPath = this._getThirdPartyTypeshedPath(this._configOptions.typeshedPath, importFailureInfo);
 
         if (!this._cachedTypeshedThirdPartyPackagePaths) {
             this._buildTypeshedThirdPartyPackageMap(typeshedPath);
@@ -1873,8 +2158,8 @@ export class ImportResolver {
         return [];
     }
 
-    private _getThirdPartyTypeshedPackageRoots(execEnv: ExecutionEnvironment, importFailureInfo: string[]) {
-        const typeshedPath = this._getThirdPartyTypeshedPath(execEnv, importFailureInfo);
+    private _getThirdPartyTypeshedPackageRoots(importFailureInfo: string[]) {
+        const typeshedPath = this._getThirdPartyTypeshedPath(this._configOptions.typeshedPath, importFailureInfo);
 
         if (!this._cachedTypeshedThirdPartyPackagePaths) {
             this._buildTypeshedThirdPartyPackageMap(typeshedPath);
@@ -1883,41 +2168,34 @@ export class ImportResolver {
         return this._cachedTypeshedThirdPartyPackageRoots!;
     }
 
-    private _getTypeshedRoot(execEnv: ExecutionEnvironment, importFailureInfo: string[]) {
-        if (this._cachedTypeshedRoot !== undefined) {
-            return this._cachedTypeshedRoot;
-        }
+    private _getTypeshedRoot(customTypeshedPath: Uri | undefined, importFailureInfo: string[]) {
+        if (this._cachedTypeshedRoot === undefined) {
+            let typeshedPath = undefined;
 
-        let typeshedPath = '';
-
-        // Did the user specify a typeshed path? If not, we'll look in the
-        // python search paths, then in the typeshed-fallback directory.
-        if (this._configOptions.typeshedPath) {
-            const possibleTypeshedPath = this._configOptions.typeshedPath;
-            if (this.dirExistsCached(possibleTypeshedPath)) {
-                typeshedPath = possibleTypeshedPath;
-            }
-        } else {
-            const pythonSearchPaths = this.getPythonSearchPaths(importFailureInfo);
-            for (const searchPath of pythonSearchPaths) {
-                const possibleTypeshedPath = combinePaths(searchPath, 'typeshed');
-                if (this.dirExistsCached(possibleTypeshedPath)) {
-                    typeshedPath = possibleTypeshedPath;
-                    break;
+            // Did the user specify a typeshed path? If not, we'll look in the
+            // python search paths, then in the typeshed-fallback directory.
+            if (customTypeshedPath) {
+                if (this.dirExistsCached(customTypeshedPath)) {
+                    typeshedPath = customTypeshedPath;
                 }
             }
+
+            // If typeshed directory wasn't found in other locations, use the fallback.
+            if (!typeshedPath) {
+                typeshedPath = PythonPathUtils.getTypeShedFallbackPath(this.fileSystem) ?? Uri.empty();
+            }
+
+            this._cachedTypeshedRoot = typeshedPath;
         }
 
-        // If typeshed directory wasn't found in other locations, use the fallback.
-        if (!typeshedPath) {
-            typeshedPath = PythonPathUtils.getTypeShedFallbackPath(this.fileSystem) || '';
-        }
-
-        this._cachedTypeshedRoot = typeshedPath;
-        return typeshedPath;
+        return this._cachedTypeshedRoot.isEmpty() ? undefined : this._cachedTypeshedRoot;
     }
 
-    private _getTypeshedSubdirectory(isStdLib: boolean, execEnv: ExecutionEnvironment, importFailureInfo: string[]) {
+    private _getTypeshedSubdirectory(
+        isStdLib: boolean,
+        customTypeshedPath: Uri | undefined,
+        importFailureInfo: string[]
+    ) {
         // See if we have it cached.
         if (isStdLib) {
             if (this._cachedTypeshedStdLibPath !== undefined) {
@@ -1929,9 +2207,12 @@ export class ImportResolver {
             }
         }
 
-        let typeshedPath = this._getTypeshedRoot(execEnv, importFailureInfo);
-        typeshedPath = PythonPathUtils.getTypeshedSubdirectory(typeshedPath, isStdLib);
+        let typeshedPath = this._getTypeshedRoot(customTypeshedPath, importFailureInfo);
+        if (typeshedPath === undefined) {
+            return undefined;
+        }
 
+        typeshedPath = PythonPathUtils.getTypeshedSubdirectory(typeshedPath, isStdLib);
         if (!this.dirExistsCached(typeshedPath)) {
             return undefined;
         }
@@ -1947,7 +2228,7 @@ export class ImportResolver {
     }
 
     private _resolveRelativeImport(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor,
         importName: string,
@@ -1956,10 +2237,7 @@ export class ImportResolver {
         importFailureInfo.push('Attempting to resolve relative import');
 
         // Determine which search path this file is part of.
-        const directory = getDirectoryLeadingDotsPointsTo(
-            getDirectoryPath(sourceFilePath),
-            moduleDescriptor.leadingDots
-        );
+        const directory = getDirectoryLeadingDotsPointsTo(sourceFileUri.getDirectory(), moduleDescriptor.leadingDots);
         if (!directory) {
             importFailureInfo.push(`Invalid relative path '${importName}'`);
             return undefined;
@@ -1967,6 +2245,7 @@ export class ImportResolver {
 
         // Now try to match the module parts from the current directory location.
         const absImport = this.resolveAbsoluteImport(
+            sourceFileUri,
             directory,
             execEnv,
             moduleDescriptor,
@@ -1981,6 +2260,7 @@ export class ImportResolver {
             // the same folder for the real module. Otherwise, it will
             // error out on runtime.
             absImport.nonStubImportResult = this.resolveAbsoluteImport(
+                sourceFileUri,
                 directory,
                 execEnv,
                 moduleDescriptor,
@@ -1998,7 +2278,7 @@ export class ImportResolver {
                 isNamespacePackage: false,
                 isStubPackage: false,
                 importFailureInfo,
-                resolvedPaths: [],
+                resolvedUris: [],
                 importType: ImportType.Local,
                 isStubFile: false,
                 isNativeLib: false,
@@ -2008,49 +2288,58 @@ export class ImportResolver {
             };
         }
 
-        return this.filterImplicitImports(absImport, moduleDescriptor.importedSymbols);
+        return absImport;
     }
 
     private _getCompletionSuggestionsRelative(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         moduleDescriptor: ImportedModuleDescriptor,
-        suggestions: Set<string>
+        suggestions: Map<string, Uri>
     ) {
         // Determine which search path this file is part of.
-        const directory = getDirectoryLeadingDotsPointsTo(
-            getDirectoryPath(sourceFilePath),
-            moduleDescriptor.leadingDots
-        );
+        const directory = getDirectoryLeadingDotsPointsTo(sourceFileUri.getDirectory(), moduleDescriptor.leadingDots);
         if (!directory) {
             return;
         }
 
         // Now try to match the module parts from the current directory location.
-        this._getCompletionSuggestionsAbsolute(sourceFilePath, execEnv, directory, moduleDescriptor, suggestions);
+        this._getCompletionSuggestionsAbsolute(sourceFileUri, execEnv, directory, moduleDescriptor, suggestions);
     }
 
-    private _getFilesInDirectory(dirPath: string): string[] {
-        const entriesInDir = this.readdirEntriesCached(dirPath);
-        const filesInDir = entriesInDir.filter((f) => f.isFile()).map((f) => f.name);
+    private _getFilesInDirectory(dirPath: Uri): Uri[] {
+        const cachedValue = this._cachedFilesForPath.get(dirPath.key);
+        if (cachedValue) {
+            return cachedValue;
+        }
 
-        // Add any symbolic links that point to files.
-        entriesInDir.forEach((f) => {
-            const linkPath = combinePaths(dirPath, f.name);
-            if (f.isSymbolicLink() && tryStat(this.fileSystem, linkPath)?.isFile()) {
-                filesInDir.push(f.name);
-            }
-        });
+        let newCacheValue: Uri[] = [];
+        try {
+            const entriesInDir = this.readdirEntriesCached(dirPath);
+            const filesInDir = entriesInDir.filter((f) => f.isFile());
 
-        return filesInDir;
+            // Add any symbolic links that point to files.
+            entriesInDir.forEach((f) => {
+                if (f.isSymbolicLink() && tryStat(this.fileSystem, dirPath.combinePaths(f.name))?.isFile()) {
+                    filesInDir.push(f);
+                }
+            });
+
+            newCacheValue = filesInDir.map((f) => dirPath.combinePaths(f.name));
+        } catch {
+            newCacheValue = [];
+        }
+
+        this._cachedFilesForPath.set(dirPath.key, newCacheValue);
+        return newCacheValue;
     }
 
     private _getCompletionSuggestionsAbsolute(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
-        rootPath: string,
+        rootPath: Uri,
         moduleDescriptor: ImportedModuleDescriptor,
-        suggestions: Set<string>,
+        suggestions: Map<string, Uri>,
         strictOnly = true
     ) {
         // Starting at the specified path, walk the file system to find the
@@ -2073,7 +2362,7 @@ export class ImportResolver {
         // dot (or multiple) in a relative path.
         if (nameParts.length === 0) {
             this._addFilteredSuggestionsAbsolute(
-                sourceFilePath,
+                sourceFileUri,
                 execEnv,
                 dirPath,
                 '',
@@ -2088,7 +2377,7 @@ export class ImportResolver {
                 // of the name.
                 if (i === nameParts.length - 1) {
                     this._addFilteredSuggestionsAbsolute(
-                        sourceFilePath,
+                        sourceFileUri,
                         execEnv,
                         dirPath,
                         nameParts[i],
@@ -2099,7 +2388,7 @@ export class ImportResolver {
                     );
                 }
 
-                dirPath = combinePaths(dirPath, nameParts[i]);
+                dirPath = dirPath.combinePaths(nameParts[i]);
                 if (!this.dirExistsCached(dirPath)) {
                     break;
                 }
@@ -2108,11 +2397,11 @@ export class ImportResolver {
     }
 
     private _addFilteredSuggestionsAbsolute(
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
-        currentPath: string,
+        currentPath: Uri,
         filter: string,
-        suggestions: Set<string>,
+        suggestions: Map<string, Uri>,
         leadingDots: number,
         parentNameParts: string[],
         strictOnly: boolean
@@ -2127,10 +2416,9 @@ export class ImportResolver {
         entries.files.forEach((file) => {
             // Strip multi-dot extensions to handle file names like "foo.cpython-32m.so". We want
             // to detect the ".so" but strip off the entire ".cpython-32m.so" extension.
-            const fileExtension = getFileExtension(file, /* multiDotExtension */ false).toLowerCase();
-            const fileWithoutExtension = stripFileExtension(file, /* multiDotExtension */ true);
+            const fileWithoutExtension = file.stripAllExtensions().fileName;
 
-            if (supportedFileExtensions.some((ext) => ext === fileExtension)) {
+            if (ImportResolver.isSupportedImportFile(file)) {
                 if (fileWithoutExtension === '__init__') {
                     return;
                 }
@@ -2145,7 +2433,7 @@ export class ImportResolver {
                         fileWithoutExtension,
                         leadingDots,
                         parentNameParts,
-                        sourceFilePath,
+                        sourceFileUri,
                         execEnv,
                         strictOnly
                     )
@@ -2153,23 +2441,44 @@ export class ImportResolver {
                     return;
                 }
 
-                suggestions.add(fileWithoutExtension);
+                suggestions.set(fileWithoutExtension, file);
             }
         });
 
         entries.directories.forEach((dir) => {
-            if (filter && !dir.startsWith(filter)) {
+            const dirSuggestion = dir.fileName;
+            if (filter && !dirSuggestion.startsWith(filter)) {
                 return;
             }
 
             if (
-                !this._isUniqueValidSuggestion(dir, suggestions) ||
-                !this._isResolvableSuggestion(dir, leadingDots, parentNameParts, sourceFilePath, execEnv, strictOnly)
+                !this._isUniqueValidSuggestion(dirSuggestion, suggestions) ||
+                !this._isResolvableSuggestion(
+                    dirSuggestion,
+                    leadingDots,
+                    parentNameParts,
+                    sourceFileUri,
+                    execEnv,
+                    strictOnly
+                )
             ) {
                 return;
             }
 
-            suggestions.add(dir);
+            const initPyiPath = dir.initPyiUri;
+            if (this.fileExistsCached(initPyiPath)) {
+                suggestions.set(dirSuggestion, initPyiPath);
+                return;
+            }
+
+            const initPyPath = dir.initPyUri;
+            if (this.fileExistsCached(initPyPath)) {
+                suggestions.set(dirSuggestion, initPyPath);
+                return;
+            }
+
+            // It is a namespace package. there is no corresponding module path.
+            suggestions.set(dirSuggestion, Uri.empty());
         });
     }
 
@@ -2179,30 +2488,45 @@ export class ImportResolver {
         name: string,
         leadingDots: number,
         parentNameParts: string[],
-        sourceFilePath: string,
+        sourceFileUri: Uri,
         execEnv: ExecutionEnvironment,
         strictOnly: boolean
     ) {
-        // We always resolve names based on sourceFilePath.
-        const moduleDescriptor = {
+        // We always resolve names based on sourceFileUri.
+        const moduleDescriptor: ImportedModuleDescriptor = {
             leadingDots: leadingDots,
             nameParts: [...parentNameParts, name],
-            importedSymbols: [],
+            importedSymbols: new Set<string>(),
         };
 
         // Make sure we don't use parent folder resolution when checking whether the given name is resolvable.
+        let importResult: ImportResult | undefined;
         if (strictOnly) {
-            const importName = this.formatImportName(moduleDescriptor);
+            const importName = formatImportName(moduleDescriptor);
             const importFailureInfo: string[] = [];
 
-            return this._resolveImportStrict(importName, sourceFilePath, execEnv, moduleDescriptor, importFailureInfo)
-                .isImportFound;
+            importResult = this._resolveImportStrict(
+                importName,
+                sourceFileUri,
+                execEnv,
+                moduleDescriptor,
+                importFailureInfo
+            );
+        } else {
+            importResult = this.resolveImportInternal(sourceFileUri, execEnv, moduleDescriptor);
         }
 
-        return this._resolveImport(sourceFilePath, execEnv, moduleDescriptor).isImportFound;
+        if (importResult && importResult.isImportFound) {
+            // Check the import isn't for a private or protected module. If it is, then
+            // only allow it if there's no py.typed file.
+            if (!SymbolNameUtils.isPrivateOrProtectedName(name) || importResult.pyTypedInfo === undefined) {
+                return true;
+            }
+        }
+        return false;
     }
 
-    private _isUniqueValidSuggestion(suggestionToAdd: string, suggestions: Set<string>) {
+    private _isUniqueValidSuggestion(suggestionToAdd: string, suggestions: Map<string, Uri>) {
         if (suggestions.has(suggestionToAdd)) {
             return false;
         }
@@ -2220,37 +2544,11 @@ export class ImportResolver {
         return true;
     }
 
-    // Potentially modifies the ImportResult by removing some or all of the
-    // implicit import entries. Only the imported symbols should be included.
-    protected filterImplicitImports(importResult: ImportResult, importedSymbols: string[] | undefined): ImportResult {
-        if (importedSymbols === undefined) {
-            const newImportResult = Object.assign({}, importResult);
-            newImportResult.filteredImplicitImports = [];
-            return newImportResult;
-        }
-
-        if (importedSymbols.length === 0) {
-            return importResult;
-        }
-
-        if (importResult.implicitImports.length === 0) {
-            return importResult;
-        }
-
-        const filteredImplicitImports = importResult.implicitImports.filter((implicitImport) => {
-            return importedSymbols.some((sym) => sym === implicitImport.name);
-        });
-
-        if (filteredImplicitImports.length === importResult.implicitImports.length) {
-            return importResult;
-        }
-
-        const newImportResult = Object.assign({}, importResult);
-        newImportResult.filteredImplicitImports = filteredImplicitImports;
-        return newImportResult;
-    }
-
-    private _findImplicitImports(importingModuleName: string, dirPath: string, exclusions: string[]): ImplicitImport[] {
+    private _findImplicitImports(
+        importingModuleName: string,
+        dirPath: Uri,
+        exclusions: Uri[]
+    ): Map<string, ImplicitImport> {
         const implicitImportMap = new Map<string, ImplicitImport>();
 
         // Enumerate all of the files and directories in the path, expanding links.
@@ -2261,32 +2559,31 @@ export class ImportResolver {
         );
 
         // Add implicit file-based modules.
-        for (const fileName of entries.files) {
-            const fileExt = getFileExtension(fileName);
+        for (const filePath of entries.files) {
+            const fileExt = filePath.lastExtension;
             let strippedFileName: string;
             let isNativeLib = false;
 
             if (fileExt === '.py' || fileExt === '.pyi') {
-                strippedFileName = stripFileExtension(fileName);
+                strippedFileName = stripFileExtension(filePath.fileName);
             } else if (
-                this._isNativeModuleFileExtension(fileExt) &&
-                !this.fileExistsCached(`${fileName}.py`) &&
-                !this.fileExistsCached(`${fileName}.pyi`)
+                _isNativeModuleFileExtension(fileExt) &&
+                !this.fileExistsCached(filePath.packageUri) &&
+                !this.fileExistsCached(filePath.packageStubUri)
             ) {
                 // Native module.
-                strippedFileName = fileName.substr(0, fileName.indexOf('.'));
+                strippedFileName = filePath.stripAllExtensions().fileName;
                 isNativeLib = true;
             } else {
                 continue;
             }
 
-            const filePath = combinePaths(dirPath, fileName);
-            if (!exclusions.find((exclusion) => exclusion === filePath)) {
+            if (!exclusions.find((exclusion) => exclusion.equals(filePath))) {
                 const implicitImport: ImplicitImport = {
-                    isStubFile: fileName.endsWith('.pyi'),
+                    isStubFile: filePath.hasExtension('.pyi'),
                     isNativeLib,
                     name: strippedFileName,
-                    path: filePath,
+                    uri: filePath,
                 };
 
                 // Always prefer stub files over non-stub files.
@@ -2294,14 +2591,14 @@ export class ImportResolver {
                 if (!entry || !entry.isStubFile) {
                     // Try resolving resolving native lib to a custom stub.
                     if (isNativeLib) {
-                        const nativeLibPath = combinePaths(dirPath, fileName);
+                        const nativeLibPath = filePath;
                         const nativeStubPath = this.resolveNativeImportEx(
                             nativeLibPath,
                             `${importingModuleName}.${strippedFileName}`,
                             []
                         );
                         if (nativeStubPath) {
-                            implicitImport.path = nativeStubPath;
+                            implicitImport.uri = nativeStubPath;
                             implicitImport.isNativeLib = false;
                         }
                     }
@@ -2311,11 +2608,11 @@ export class ImportResolver {
         }
 
         // Add implicit directory-based modules.
-        for (const dirName of entries.directories) {
-            const pyFilePath = combinePaths(dirPath, dirName, '__init__.py');
-            const pyiFilePath = pyFilePath + 'i';
+        for (const dirPath of entries.directories) {
+            const pyFilePath = dirPath.initPyUri;
+            const pyiFilePath = dirPath.initPyiUri;
             let isStubFile = false;
-            let path = '';
+            let path: Uri | undefined;
 
             if (this.fileExistsCached(pyiFilePath)) {
                 isStubFile = true;
@@ -2325,12 +2622,13 @@ export class ImportResolver {
             }
 
             if (path) {
-                if (!exclusions.find((exclusion) => exclusion === path)) {
+                if (!exclusions.find((exclusion) => exclusion.equals(path))) {
                     const implicitImport: ImplicitImport = {
                         isStubFile,
                         isNativeLib: false,
-                        name: dirName,
-                        path,
+                        name: dirPath.fileName,
+                        uri: path,
+                        pyTypedInfo: this._getPyTypedInfo(dirPath),
                     };
 
                     implicitImportMap.set(implicitImport.name, implicitImport);
@@ -2338,20 +2636,62 @@ export class ImportResolver {
             }
         }
 
-        return [...implicitImportMap.values()];
+        return implicitImportMap;
     }
 
-    protected formatImportName(moduleDescriptor: ImportedModuleDescriptor) {
-        return '.'.repeat(moduleDescriptor.leadingDots) + moduleDescriptor.nameParts.join('.');
+    // Retrieves the pytyped info for a directory if it exists. This is a small perf optimization
+    // that allows skipping the search when the pytyped file doesn't exist.
+    private _getPyTypedInfo(filePath: Uri): PyTypedInfo | undefined {
+        if (!this.fileExistsCached(filePath.pytypedUri)) {
+            return undefined;
+        }
+
+        return getPyTypedInfoForPyTypedFile(this.fileSystem, filePath.pytypedUri);
     }
 
-    private _resolveNativeModuleStub(
-        nativeLibPath: string,
+    private _findAndResolveNativeModule(
+        fileDirectory: Uri,
+        dirPath: Uri,
         execEnv: ExecutionEnvironment,
         importName: string,
         moduleDescriptor: ImportedModuleDescriptor,
         importFailureInfo: string[],
-        resolvedPaths: string[]
+        resolvedPaths: Uri[]
+    ): boolean {
+        let isNativeLib = false;
+
+        if (!execEnv.skipNativeLibraries && this.dirExistsCached(fileDirectory)) {
+            const filesInDir = this._getFilesInDirectory(fileDirectory);
+            const dirName = dirPath.fileName;
+            const nativeLibPath = filesInDir.find((f) => this._isNativeModuleFileName(dirName, f));
+
+            if (nativeLibPath) {
+                // Try resolving native library to a custom stub.
+                isNativeLib = this._resolveNativeModuleWithStub(
+                    nativeLibPath,
+                    execEnv,
+                    importName,
+                    moduleDescriptor,
+                    importFailureInfo,
+                    resolvedPaths
+                );
+
+                if (isNativeLib) {
+                    importFailureInfo.push(`Resolved with native lib '${nativeLibPath.toUserVisibleString()}'`);
+                }
+            }
+        }
+
+        return isNativeLib;
+    }
+
+    private _resolveNativeModuleWithStub(
+        nativeLibPath: Uri,
+        execEnv: ExecutionEnvironment,
+        importName: string,
+        moduleDescriptor: ImportedModuleDescriptor,
+        importFailureInfo: string[],
+        resolvedPaths: Uri[]
     ): boolean {
         let moduleFullName = importName;
 
@@ -2373,46 +2713,123 @@ export class ImportResolver {
         return true;
     }
 
-    private _isNativeModuleFileName(moduleName: string, fileName: string): boolean {
+    private _isNativeModuleFileName(moduleName: string, fileUri: Uri): boolean {
         // Strip off the final file extension and the part of the file name
         // that excludes all (multi-part) file extensions. This allows us to
         // handle file names like "foo.cpython-32m.so".
-        const fileExtension = getFileExtension(fileName, /* multiDotExtension */ false).toLowerCase();
-        const withoutExtension = stripFileExtension(fileName, /* multiDotExtension */ true);
+        const fileExtension = fileUri.lastExtension.toLowerCase();
+        const withoutExtension = stripFileExtension(fileUri.fileName, /* multiDotExtension */ true);
         return (
-            this._isNativeModuleFileExtension(fileExtension) &&
-            equateStringsCaseInsensitive(moduleName, withoutExtension)
+            _isNativeModuleFileExtension(fileExtension) && equateStringsCaseInsensitive(moduleName, withoutExtension)
         );
     }
 
-    private _isNativeModuleFileExtension(fileExtension: string): boolean {
-        return supportedNativeLibExtensions.some((ext) => ext === fileExtension);
-    }
-
-    private _tryWalkUp(current: string): [success: boolean, path: string] {
-        if (isDiskPathRoot(current)) {
-            return [false, ''];
+    private _tryWalkUp(current: Uri | undefined): Uri | undefined {
+        if (!current || current.isEmpty() || current.isRoot()) {
+            return undefined;
         }
 
-        return [
-            true,
-            ensureTrailingDirectorySeparator(
-                normalizePathCase(this.fileSystem, normalizePath(combinePaths(current, '..')))
-            ),
-        ];
-    }
-
-    private _shouldWalkUp(current: string, root: string, execEnv: ExecutionEnvironment) {
-        return current.length > root.length || (current === root && !execEnv.root);
-    }
-
-    protected getParentImportResolutionRoot(sourceFilePath: string, executionRoot: string | undefined) {
-        if (executionRoot) {
-            return ensureTrailingDirectorySeparator(normalizePathCase(this.fileSystem, normalizePath(executionRoot)));
+        // Ensure we don't go around forever even if isRoot returns false.
+        const next = current.resolvePaths('..');
+        if (next.equals(current)) {
+            return undefined;
         }
+        return next;
+    }
 
-        return ensureTrailingDirectorySeparator(getDirectoryPath(sourceFilePath));
+    private _shouldWalkUp(current: Uri | undefined, root: Uri, execEnv: ExecutionEnvironment) {
+        return (
+            current &&
+            !current.isEmpty() &&
+            (current.isChild(root) || (current.equals(root) && _isDefaultWorkspace(execEnv.root)))
+        );
     }
 }
 
-export type ImportResolverFactory = (fs: FileSystem, options: ConfigOptions, host: Host) => ImportResolver;
+export type ImportResolverFactory = (
+    serviceProvider: ServiceProvider,
+    options: ConfigOptions,
+    host: Host
+) => ImportResolver;
+
+export function formatImportName(moduleDescriptor: ImportedModuleDescriptor) {
+    return '.'.repeat(moduleDescriptor.leadingDots) + moduleDescriptor.nameParts.join('.');
+}
+
+export function getParentImportResolutionRoot(sourceFileUri: Uri, executionRoot: Uri | undefined): Uri {
+    if (!_isDefaultWorkspace(executionRoot)) {
+        return executionRoot!;
+    }
+
+    return sourceFileUri.getDirectory();
+}
+
+export function getModuleNameFromPath(
+    containerPath: Uri,
+    fileUri: Uri,
+    stripTopContainerDir = false
+): string | undefined {
+    const moduleNameInfo = _getModuleNameInfoFromPath(containerPath, fileUri, stripTopContainerDir);
+    if (!moduleNameInfo || moduleNameInfo.containsInvalidCharacters) {
+        return undefined;
+    }
+
+    return moduleNameInfo.moduleName;
+}
+
+function _getModuleNameInfoFromPath(
+    containerPath: Uri,
+    fileUri: Uri,
+    stripTopContainerDir = false
+): ModuleNameInfoFromPath | undefined {
+    let fileUriWithoutExtension = fileUri.stripExtension();
+
+    // If module is native, strip platform part, such as 'cp36-win_amd64' in 'mtrand.cp36-win_amd64'.
+    if (_isNativeModuleFileExtension(fileUri.lastExtension)) {
+        fileUriWithoutExtension = fileUriWithoutExtension.stripExtension();
+    }
+
+    if (!fileUriWithoutExtension.startsWith(containerPath)) {
+        return undefined;
+    }
+
+    // Strip off the '/__init__' if it's present.
+    if (fileUriWithoutExtension.pathEndsWith('__init__')) {
+        fileUriWithoutExtension = fileUriWithoutExtension.getDirectory();
+    }
+
+    const parts = Array.from(containerPath.getRelativePathComponents(fileUriWithoutExtension));
+    if (stripTopContainerDir) {
+        if (parts.length === 0) {
+            return undefined;
+        }
+        parts.shift();
+    }
+
+    if (parts.length === 0) {
+        return undefined;
+    }
+
+    // Handle the case where the symbol was resolved to a stubs package
+    // rather than the real package. We'll strip off the "-stubs" suffix
+    // in this case.
+    if (parts[0].endsWith(stubsSuffix)) {
+        parts[0] = parts[0].substr(0, parts[0].length - stubsSuffix.length);
+    }
+
+    // Check whether parts contains invalid characters.
+    const containsInvalidCharacters = parts.some((p) => !Tokenizer.isPythonIdentifier(p));
+
+    return {
+        moduleName: parts.join('.'),
+        containsInvalidCharacters,
+    };
+}
+
+function _isNativeModuleFileExtension(fileExtension: string): boolean {
+    return supportedNativeLibExtensions.some((ext) => ext === fileExtension);
+}
+
+function _isDefaultWorkspace(uri: Uri | undefined) {
+    return !uri || uri.isEmpty() || Uri.isDefaultWorkspace(uri);
+}

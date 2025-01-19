@@ -1,20 +1,21 @@
 # This sample tests the handling of metaclass keyword arguments.
 
-from typing import Tuple, Dict, Any, Type
-from typing_extensions import Self
+from typing import Any, TypeVar
+
+T = TypeVar("T")
 
 
 class Meta1(type):
     def __new__(
-        cls: Type[Self],
+        cls: type[T],
         cls_name: str,
-        bases: Tuple[type, ...],
-        attrs: Dict[str, Any],
+        bases: tuple[type, ...],
+        attrs: dict[str, Any],
         *,
         param1: int,
         param2: str,
         param3: str = "",
-    ) -> Self:
+    ) -> T:
         ...
 
 
@@ -43,14 +44,14 @@ class Class1_5(metaclass=Meta1, param2="", param1=1, param4=3):
 
 class Meta2(type):
     def __new__(
-        cls: Type[Self],
+        cls: type[T],
         cls_name: str,
-        bases: Tuple[type, ...],
-        attrs: Dict[str, Any],
+        bases: tuple[type, ...],
+        attrs: dict[str, Any],
         *,
         param1: int,
         **kwargs: str,
-    ) -> Self:
+    ) -> T:
         ...
 
 

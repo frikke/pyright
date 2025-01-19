@@ -1,5 +1,8 @@
 /*
  * testWalker.ts
+ * Copyright (c) Microsoft Corporation.
+ * Licensed under the MIT license.
+ * Author: Eric Traut
  *
  * Walks a parse tree to validate internal consistency and completeness.
  */
@@ -8,6 +11,7 @@ import { ParseTreeWalker } from '../analyzer/parseTreeWalker';
 import { fail } from '../common/debug';
 import { TextRange } from '../common/textRange';
 import { NameNode, ParseNode, ParseNodeArray, ParseNodeType } from '../parser/parseNodes';
+import { isCompliantWithNodeRangeRules } from './parseTreeUtils';
 import { TypeEvaluator } from './typeEvaluatorTypes';
 
 export class TestWalker extends ParseTreeWalker {
@@ -43,21 +47,42 @@ export class TestWalker extends ParseTreeWalker {
     private _verifyChildRanges(node: ParseNode, children: ParseNodeArray) {
         let prevNode: ParseNode | undefined;
 
+        const compliant = isCompliantWithNodeRangeRules(node);
         children.forEach((child) => {
             if (child) {
                 let skipCheck = false;
 
-                // There are a few exceptions we need to deal with here. Comment
-                // annotations can occur outside of an assignment node's range.
-                if (node.nodeType === ParseNodeType.Assignment) {
-                    if (child === node.typeAnnotationComment) {
-                        skipCheck = true;
-                    }
-                }
+                if (!compliant) {
+                    switch (node.nodeType) {
+                        case ParseNodeType.Assignment:
+                            // There are a few exceptions we need to deal with here. Comment
+                            // annotations can occur outside of an assignment node's range.
+                            if (child === node.d.annotationComment) {
+                                skipCheck = true;
+                            }
 
-                if (node.nodeType === ParseNodeType.StringList) {
-                    if (child === node.typeAnnotation) {
-                        skipCheck = true;
+                            // Portions of chained assignments can occur outside of an
+                            // assignment node's range.
+                            if (child.nodeType === ParseNodeType.Assignment) {
+                                skipCheck = true;
+                            }
+                            break;
+
+                        case ParseNodeType.StringList:
+                            if (child === node.d.annotation) {
+                                skipCheck = true;
+                            }
+                            break;
+
+                        case ParseNodeType.Argument: {
+                            if (node.d.isNameSameAsValue) {
+                                skipCheck = true;
+                            }
+                            break;
+                        }
+
+                        default:
+                            fail(`node ${node.nodeType} is not marked as not following range rules.`);
                     }
                 }
 
@@ -66,11 +91,20 @@ export class TestWalker extends ParseTreeWalker {
                     if (child.start < node.start || TextRange.getEnd(child) > TextRange.getEnd(node)) {
                         fail(`Child node ${child.nodeType} is not contained within its parent ${node.nodeType}`);
                     }
+
                     if (prevNode) {
                         // Make sure the child is after the previous child.
                         if (child.start < TextRange.getEnd(prevNode)) {
                             // Special-case the function annotation which can "bleed" into the suite.
-                            if (prevNode.nodeType !== ParseNodeType.FunctionAnnotation) {
+                            let exempted = prevNode.nodeType === ParseNodeType.FunctionAnnotation;
+
+                            // Special-case name nodes that are part of an argument node that's
+                            // using a keyword argument shortcut.
+                            if (node.nodeType === ParseNodeType.Argument && node.d.isNameSameAsValue) {
+                                exempted = true;
+                            }
+
+                            if (!exempted) {
                                 fail(`Child node is not after previous child node`);
                             }
                         }

@@ -1,3 +1,4 @@
+from _typeshed import Incomplete
 from typing import Any, NamedTuple
 
 from psutil._common import (
@@ -20,10 +21,10 @@ kinfo_proc_map: Any
 pidtaskinfo_map: Any
 
 class scputimes(NamedTuple):
-    user: Any
-    nice: Any
-    system: Any
-    idle: Any
+    user: float
+    nice: float
+    system: float
+    idle: float
 
 class svmem(NamedTuple):
     total: int
@@ -41,7 +42,12 @@ class pmem(NamedTuple):
     pfaults: Any
     pageins: Any
 
-pfullmem: Any
+class pfullmem(NamedTuple):
+    rss: Incomplete
+    vms: Incomplete
+    pfaults: Incomplete
+    pageins: Incomplete
+    uss: Incomplete
 
 def virtual_memory() -> svmem: ...
 def swap_memory(): ...
@@ -93,9 +99,9 @@ class Process:
     def num_ctx_switches(self): ...
     def num_threads(self): ...
     def open_files(self): ...
-    def connections(self, kind: str = ...): ...
+    def net_connections(self, kind: str = ...): ...
     def num_fds(self): ...
-    def wait(self, timeout: Any | None = ...): ...
+    def wait(self, timeout: Incomplete | None = ...): ...
     def nice_get(self): ...
     def nice_set(self, value): ...
     def status(self): ...

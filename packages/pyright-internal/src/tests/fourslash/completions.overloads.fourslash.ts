@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: overloads_client.py
 //// import overloads
@@ -27,7 +27,7 @@ await helper.verifyCompletion('included', 'markdown', {
                 label: 'func',
                 kind: Consts.CompletionItemKind.Function,
                 documentation:
-                    '```python\nfunc(x: str) -> str\nfunc(x: bytes) -> bytes\nfunc(x: int) -> int\n```\n---\nfunc docs',
+                    '```python\ndef func(x: str) -> str: ...\ndef func(x: bytes) -> bytes: ...\ndef func(x: int) -> int: ...\n```\n---\nfunc docs',
             },
         ],
     },

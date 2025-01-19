@@ -1,6 +1,16 @@
 from _typeshed import Incomplete
+from collections.abc import Callable
+from typing_extensions import TypeAlias
 
-from pythoncom import com_error as com_error
+import pythoncom
+
+com_error = pythoncom.com_error
+
+# Type of pythoncom._univgw.WriteFromOutTuple
+# The two tuples must be of equal length
+_WriteFromOutTupleType: TypeAlias = Callable[
+    [tuple[Incomplete, ...] | None, tuple[Incomplete, ...] | None, int], Incomplete | None
+]
 
 def RegisterInterfaces(typelibGUID, lcid, major, minor, interface_names: Incomplete | None = ...): ...
 
@@ -23,4 +33,4 @@ class Definition:
     def iid(self): ...
     def vtbl_argsizes(self): ...
     def vtbl_argcounts(self): ...
-    def dispatch(self, ob, index, argPtr, ReadFromInTuple=..., WriteFromOutTuple=...): ...
+    def dispatch(self, ob, index, argPtr, ReadFromInTuple=..., WriteFromOutTuple: _WriteFromOutTupleType = ...): ...

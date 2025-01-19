@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: test.py
 //// class Foo:
@@ -11,5 +11,5 @@
 //// x = [|/*marker1*/Foo|]()
 
 helper.verifyHover('markdown', {
-    marker1: '```python\n(class) Foo(name: str)\n```\n---\ndoc for \\_\\_new\\_\\_.',
+    marker1: '```python\nclass Foo(name: str)\n```\n---\ndoc for \\_\\_new\\_\\_.',
 });

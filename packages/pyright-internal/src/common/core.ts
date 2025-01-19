@@ -6,6 +6,8 @@
  * Various helpers that don't have a dependency on other code files.
  */
 
+import { TextRange } from './textRange';
+
 export const enum Comparison {
     LessThan = -1,
     EqualTo = 0,
@@ -74,7 +76,7 @@ export function compareValues(a: number | undefined, b: number | undefined): Com
 /**
  * Tests whether a value is an array.
  */
-export function isArray(value: any): value is readonly {}[] {
+export function isArray<T extends any[]>(value: any): value is T {
     return Array.isArray ? Array.isArray(value) : value instanceof Array;
 }
 
@@ -100,8 +102,11 @@ const hasOwnProperty = Object.prototype.hasOwnProperty;
  * The `in` and `for-in` operators can *not* be safely used,
  * since `Object.prototype` may be modified by outside code.
  */
-export interface MapLike<T> {
-    [index: string]: T;
+export interface MapLike<K, V> {
+    readonly [Symbol.toStringTag]: string;
+    get(key: K): V | undefined;
+    has(key: K): boolean;
+    set(key: K, value: V): this;
 }
 
 /**
@@ -110,7 +115,7 @@ export interface MapLike<T> {
  * @param map A map-like.
  * @param key A property key.
  */
-export function hasProperty(map: MapLike<any>, key: string): boolean {
+export function hasProperty(map: { [index: string]: any }, key: string): boolean {
     return hasOwnProperty.call(map, key);
 }
 
@@ -172,4 +177,18 @@ export function getEnumNames<T>(enumType: T) {
     }
 
     return result;
+}
+
+export function containsOnlyWhitespace(text: string, span?: TextRange) {
+    if (span) {
+        text = text.substring(span.start, TextRange.getEnd(span));
+    }
+
+    return /^\s*$/.test(text);
+}
+
+export namespace Disposable {
+    export function is(value: any): value is { dispose(): void } {
+        return value && typeof value.dispose === 'function';
+    }
 }

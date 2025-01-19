@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: test.py
 //// class Parent:
@@ -12,5 +12,5 @@
 //// x = [|/*marker1*/Child|]()
 
 helper.verifyHover('markdown', {
-    marker1: '```python\n(class) Child(name: str)\n```',
+    marker1: '```python\nclass Child(name: str)\n```',
 });

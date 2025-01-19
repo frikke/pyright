@@ -7,9 +7,11 @@
  * Specifies the range of text within a larger string.
  */
 
+import { Uri } from './uri/uri';
+
 export interface TextRange {
-    start: number;
-    length: number;
+    readonly start: number;
+    readonly length: number;
 }
 
 export namespace TextRange {
@@ -53,23 +55,34 @@ export namespace TextRange {
         return overlaps(range, other.start) || overlaps(other, range.start);
     }
 
-    export function extend(range: TextRange, extension: TextRange | TextRange[] | undefined) {
+    export function extend(range: TextRange, extension: TextRange | TextRange[] | undefined): TextRange {
+        let result = range;
+
         if (extension) {
             if (Array.isArray(extension)) {
                 extension.forEach((r) => {
-                    extend(range, r);
+                    result = extend(result, r);
                 });
             } else {
-                if (extension.start < range.start) {
-                    range.length += range.start - extension.start;
-                    range.start = extension.start;
+                if (extension.start < result.start) {
+                    result = {
+                        start: extension.start,
+                        length: result.length + result.start - extension.start,
+                    };
                 }
 
-                if (getEnd(extension) > getEnd(range)) {
-                    range.length += getEnd(extension) - getEnd(range);
+                const extensionEnd = getEnd(extension);
+                const resultEnd = getEnd(result);
+                if (extensionEnd > resultEnd) {
+                    result = {
+                        start: result.start,
+                        length: result.length + extensionEnd - resultEnd,
+                    };
                 }
             }
         }
+
+        return result;
     }
 
     export function combine(ranges: TextRange[]): TextRange | undefined {
@@ -77,9 +90,9 @@ export namespace TextRange {
             return undefined;
         }
 
-        const combinedRange = ranges[0];
+        let combinedRange = { start: ranges[0].start, length: ranges[0].length };
         for (let i = 1; i < ranges.length; i++) {
-            extend(combinedRange, ranges[i]);
+            combinedRange = extend(combinedRange, ranges[i]);
         }
         return combinedRange;
     }
@@ -120,7 +133,7 @@ export namespace Range {
 
 // Represents a range within a particular document.
 export interface DocumentRange {
-    path: string;
+    uri: Uri;
     range: Range;
 }
 

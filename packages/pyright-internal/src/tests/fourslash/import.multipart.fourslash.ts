@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: pkg/__init__.py
 //// from . import util
@@ -17,5 +17,5 @@
 
 // @ts-ignore
 helper.verifyHover('markdown', {
-    marker: '```python\n(class) Foo()\n```',
+    marker: '```python\nclass Foo()\n```',
 });

@@ -10,6 +10,7 @@
  */
 
 import { Range } from '../common/textRange';
+import { Uri } from '../common/uri/uri';
 import {
     ClassNode,
     ExpressionNode,
@@ -31,11 +32,13 @@ import {
     YieldNode,
 } from '../parser/parseNodes';
 
+export const UnresolvedModuleMarker = Uri.constant('*** unresolved module ***');
+
 export const enum DeclarationType {
     Intrinsic,
     Variable,
-    Parameter,
-    TypeParameter,
+    Param,
+    TypeParam,
     TypeAlias,
     Function,
     Class,
@@ -43,7 +46,7 @@ export const enum DeclarationType {
     Alias,
 }
 
-export type IntrinsicType = 'Any' | 'str' | 'str | None' | 'int' | 'Iterable[str]' | 'class' | 'Dict[str, Any]';
+export type IntrinsicType = 'Any' | 'str' | 'str | None' | 'int' | 'Iterable[str]' | 'type[self]' | 'Dict[str, Any]';
 
 export interface DeclarationBase {
     // Category of this symbol (function, variable, etc.).
@@ -55,9 +58,9 @@ export interface DeclarationBase {
     node: ParseNode;
 
     // The file and range within that file that
-    // contains the declaration. Unless this is an alias, then path refers to the
+    // contains the declaration. Unless this is an alias, then uri refers to the
     // file the alias is referring to.
-    path: string;
+    uri: Uri;
     range: Range;
 
     // The dot-separated import name for the file that
@@ -69,6 +72,9 @@ export interface DeclarationBase {
     // The declaration is within an except clause of a try
     // statement. We may want to ignore such declarations.
     isInExceptSuite: boolean;
+
+    // This declaration is within an inlined TypedDict definition.
+    isInInlinedTypedDict?: boolean;
 }
 
 export interface IntrinsicDeclaration extends DeclarationBase {
@@ -99,19 +105,29 @@ export interface FunctionDeclaration extends DeclarationBase {
     raiseStatements?: RaiseNode[];
 }
 
-export interface ParameterDeclaration extends DeclarationBase {
-    type: DeclarationType.Parameter;
+export interface ParamDeclaration extends DeclarationBase {
+    type: DeclarationType.Param;
     node: ParameterNode;
+
+    // Inferred parameters can be inferred from pieces of an actual NameNode, so this
+    // value represents the actual 'name' as the user thinks of it.
+    inferredName?: string;
+
+    // Nodes that potentially makeup the type of an inferred parameter.
+    inferredTypeNodes?: ExpressionNode[];
 }
 
-export interface TypeParameterDeclaration extends DeclarationBase {
-    type: DeclarationType.TypeParameter;
+export interface TypeParamDeclaration extends DeclarationBase {
+    type: DeclarationType.TypeParam;
     node: TypeParameterNode;
 }
 
 export interface TypeAliasDeclaration extends DeclarationBase {
     type: DeclarationType.TypeAlias;
     node: TypeAliasNode;
+
+    // If a docstring (based on PEP 258) is present...
+    docString?: string | undefined;
 }
 
 export interface VariableDeclaration extends DeclarationBase {
@@ -132,15 +148,6 @@ export interface VariableDeclaration extends DeclarationBase {
     // constant in that reassignment is not permitted)?
     isFinal?: boolean;
 
-    // Is the declaration a "ClassVar"?
-    isClassVar?: boolean;
-
-    // Is the declaration annotated with "Required"?
-    isRequired?: boolean;
-
-    // Is the declaration annotated with "NotRequired"?
-    isNotRequired?: boolean;
-
     // Is the declaration an entry in __slots__?
     isDefinedBySlots?: boolean;
 
@@ -154,9 +161,6 @@ export interface VariableDeclaration extends DeclarationBase {
     // and other complex (more dynamic) class definitions with typed variables.
     isRuntimeTypeExpression?: boolean;
 
-    // Points to the "TypeAlias" annotation described in PEP 613.
-    typeAliasAnnotation?: ExpressionNode | undefined;
-
     // If the declaration is a type alias, points to the alias name.
     typeAliasName?: NameNode | undefined;
 
@@ -167,6 +171,12 @@ export interface VariableDeclaration extends DeclarationBase {
 
     // If an "attribute docstring" (as defined in PEP 258) is present...
     docString?: string | undefined;
+
+    // If set, indicates an alternative node to use to determine the type of the variable.
+    alternativeTypeNode?: ExpressionNode;
+
+    // Is the declaration an assignment through an explicit nonlocal or global binding?
+    isExplicitBinding?: boolean;
 }
 
 // Alias declarations are used for imports. They are resolved
@@ -215,10 +225,10 @@ export interface AliasDeclaration extends DeclarationBase {
 // This interface represents a set of actions that the python loader
 // performs when a module import is encountered.
 export interface ModuleLoaderActions {
-    // The resolved path of the implicit import. This can be empty
-    // if the resolved path doesn't reference a module (e.g. it's
+    // The resolved uri of the implicit import. This can be empty
+    // if the resolved uri doesn't reference a module (e.g. it's
     // a directory).
-    path: string;
+    uri: Uri;
 
     // Is this a dummy entry for an unresolved import?
     isUnresolved?: boolean;
@@ -235,8 +245,8 @@ export type Declaration =
     | ClassDeclaration
     | SpecialBuiltInClassDeclaration
     | FunctionDeclaration
-    | ParameterDeclaration
-    | TypeParameterDeclaration
+    | ParamDeclaration
+    | TypeParamDeclaration
     | TypeAliasDeclaration
     | VariableDeclaration
     | AliasDeclaration;
@@ -249,12 +259,12 @@ export function isClassDeclaration(decl: Declaration): decl is ClassDeclaration 
     return decl.type === DeclarationType.Class;
 }
 
-export function isParameterDeclaration(decl: Declaration): decl is ParameterDeclaration {
-    return decl.type === DeclarationType.Parameter;
+export function isParamDeclaration(decl: Declaration): decl is ParamDeclaration {
+    return decl.type === DeclarationType.Param;
 }
 
-export function isTypeParameterDeclaration(decl: Declaration): decl is TypeParameterDeclaration {
-    return decl.type === DeclarationType.TypeParameter;
+export function isTypeParamDeclaration(decl: Declaration): decl is TypeParamDeclaration {
+    return decl.type === DeclarationType.TypeParam;
 }
 
 export function isTypeAliasDeclaration(decl: Declaration): decl is TypeAliasDeclaration {
@@ -275,4 +285,8 @@ export function isSpecialBuiltInClassDeclaration(decl: Declaration): decl is Spe
 
 export function isIntrinsicDeclaration(decl: Declaration): decl is IntrinsicDeclaration {
     return decl.type === DeclarationType.Intrinsic;
+}
+
+export function isUnresolvedAliasDeclaration(decl: Declaration): boolean {
+    return isAliasDeclaration(decl) && decl.uri.equals(UnresolvedModuleMarker);
 }

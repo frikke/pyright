@@ -41,6 +41,7 @@ export function formatControlFlowGraph(flowNode: FlowNode) {
     }
 
     const enum Connection {
+        None = 0,
         Up = 1 << 0,
         Down = 1 << 1,
         Left = 1 << 2,
@@ -104,6 +105,8 @@ export function formatControlFlowGraph(flowNode: FlowNode) {
                 FlowFlags.WildcardImport |
                 FlowFlags.TrueCondition |
                 FlowFlags.FalseCondition |
+                FlowFlags.TrueNeverCondition |
+                FlowFlags.FalseNeverCondition |
                 FlowFlags.NarrowForPattern |
                 FlowFlags.ExhaustedMatch |
                 FlowFlags.Call |
@@ -114,7 +117,6 @@ export function formatControlFlowGraph(flowNode: FlowNode) {
                 | FlowAssignment
                 | FlowVariableAnnotation
                 | FlowWildcardImport
-                | FlowCondition
                 | FlowCondition
                 | FlowExhaustedMatch
                 | FlowCall
@@ -344,8 +346,14 @@ export function formatControlFlowGraph(flowNode: FlowNode) {
                 const above = lane > 0 ? connectors[column][lane - 1] : 0;
                 let connector = connectors[column][lane];
                 if (!connector) {
-                    if (left & Connection.Right) connector |= Connection.LeftRight;
-                    if (above & Connection.Down) connector |= Connection.UpDown;
+                    connector = Connection.None;
+
+                    if (left & Connection.Right) {
+                        connector |= Connection.LeftRight;
+                    }
+                    if (above & Connection.Down) {
+                        connector |= Connection.UpDown;
+                    }
                     connectors[column][lane] = connector;
                 }
             }

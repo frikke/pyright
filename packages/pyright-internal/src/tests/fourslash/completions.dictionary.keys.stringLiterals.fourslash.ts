@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: string_literals.py
 //// d = { "key" : 1 }
@@ -25,7 +25,7 @@
 // @filename: dict_key_name_conflicts.py
 //// keyString = "key"
 //// d = dict(keyString=1)
-//// d[keyStr[|/*marker6*/|]]
+//// d[[|keyStr/*marker6*/|]]
 
 // @filename: dict_key_mixed_literals.py
 //// d = { "key": 1, 1 + 2: 1 }
@@ -42,7 +42,7 @@
                     label: '"key"',
                     kind: Consts.CompletionItemKind.Constant,
                     textEdit: { range: helper.getPositionRange('marker1'), newText: '"key"' },
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
             ],
         },
@@ -52,7 +52,7 @@
                     label: '"key"',
                     kind: Consts.CompletionItemKind.Constant,
                     textEdit: { range: helper.getPositionRange('marker2'), newText: '"key"' },
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
             ],
         },
@@ -62,7 +62,7 @@
                     label: '"key"',
                     kind: Consts.CompletionItemKind.Constant,
                     textEdit: { range: helper.getPositionRange('marker3'), newText: '"key"' },
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
             ],
         },
@@ -72,7 +72,7 @@
                     label: '"key"',
                     kind: Consts.CompletionItemKind.Constant,
                     textEdit: { range: helper.getPositionRange('marker4'), newText: '"key"' },
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
             ],
         },
@@ -81,20 +81,25 @@
                 {
                     label: 'name',
                     kind: Consts.CompletionItemKind.Constant,
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
                 {
                     label: '"key2"',
                     kind: Consts.CompletionItemKind.Constant,
                     textEdit: { range: helper.getPositionRange('marker5'), newText: '"key2"' },
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
             ],
         },
         marker6: {
             completions: [
                 { label: 'keyString', kind: Consts.CompletionItemKind.Variable },
-                { label: '"keyString"', kind: Consts.CompletionItemKind.Constant, detail: 'Dictionary key' },
+                {
+                    label: '"keyString"',
+                    kind: Consts.CompletionItemKind.Constant,
+                    textEdit: { range: helper.getPositionRange('marker6'), newText: '"keyString"' },
+                    detail: Consts.IndexValueDetail,
+                },
             ],
         },
         marker7: {
@@ -103,12 +108,12 @@
                     label: '"key"',
                     kind: Consts.CompletionItemKind.Constant,
                     textEdit: { range: helper.getPositionRange('marker7'), newText: '"key"' },
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
                 {
                     label: '1 + 2',
                     kind: Consts.CompletionItemKind.Constant,
-                    detail: 'Dictionary key',
+                    detail: Consts.IndexValueDetail,
                 },
             ],
         },

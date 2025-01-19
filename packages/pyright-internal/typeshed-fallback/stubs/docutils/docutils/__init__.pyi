@@ -1,5 +1,7 @@
-from _typeshed import Self
 from typing import Any, ClassVar, NamedTuple
+from typing_extensions import Self
+
+from docutils.transforms import Transform
 
 __docformat__: str
 __version__: str
@@ -14,13 +16,7 @@ class _VersionInfo(NamedTuple):
 
 class VersionInfo(_VersionInfo):
     def __new__(
-        cls: type[Self],
-        major: int = ...,
-        minor: int = ...,
-        micro: int = ...,
-        releaselevel: str = ...,
-        serial: int = ...,
-        release: bool = ...,
+        cls, major: int = 0, minor: int = 0, micro: int = 0, releaselevel: str = "final", serial: int = 0, release: bool = True
     ) -> Self: ...
 
 __version_info__: VersionInfo
@@ -38,7 +34,7 @@ class SettingsSpec:
     config_section_dependencies: ClassVar[tuple[str, ...] | None]
 
 class TransformSpec:
-    def get_transforms(self) -> list[Any]: ...
+    def get_transforms(self) -> list[type[Transform]]: ...
     default_transforms: ClassVar[tuple[Any, ...]]
     unknown_reference_resolvers: ClassVar[list[Any]]
 

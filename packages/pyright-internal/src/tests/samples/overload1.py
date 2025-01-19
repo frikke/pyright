@@ -1,50 +1,29 @@
-# This sample tests the type checker's handling of the overload decorator.
+# This sample verifies that the type checker doesn't use the
+# final function that omits the @overload decorator when matching
+# a caller against an overloaded function.
 
-from typing import overload, Optional
-from datetime import datetime, timezone, timedelta
+from typing import TypeVar, overload
+
+T = TypeVar("T")
 
 
 @overload
-def from_json_timestamp(ts: int) -> datetime:
+def mouse_event(x1: int, y1: int) -> int:
     ...
 
 
 @overload
-def from_json_timestamp(ts: None) -> None:
+def mouse_event(x1: int, y1: int, x2: int, y2: int) -> tuple[int, int]:
     ...
 
 
-def from_json_timestamp(ts: Optional[int]) -> Optional[datetime]:
-    return (
-        None
-        if ts is None
-        else (datetime(1970, 1, 1, tzinfo=timezone.utc) + timedelta(milliseconds=ts))
-    )
+def mouse_event(
+    x1: int, y1: int, x2: int | None = None, y2: int | None = None
+) -> int | tuple[int, int]:
+    return 1
 
 
-result1: datetime = from_json_timestamp(2418049)
-
-# This should generate an error
-result2: datetime = from_json_timestamp(None)
-
-result3: None = from_json_timestamp(None)
-
-# This should generate an error
-result4: None = from_json_timestamp(2345)
-
-
-@overload
-def func1(x: int) -> int:
-    ...
-
-
-@overload
-def func1(x: float) -> float:
-    ...
-
-
-def func1(x):
-    return x
-
-
-reveal_type(func1(abs(0.0)), expected_text="float")
+# This should generate an error because it doesn't match either
+# of the @overload versions, even though it does match the
+# version of the function that omits the @overload.
+t = mouse_event(1, 2, 3)

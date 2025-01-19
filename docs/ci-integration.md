@@ -1,4 +1,14 @@
-## Integrating Pyright into Continuous Integration (CI)
+## Integrating Pyright into Continuous Integration
+
+### Adding Pyright badge to README.md
+
+[![Checked with pyright](https://microsoft.github.io/pyright/img/pyright_badge.svg)](https://microsoft.github.io/pyright/)
+
+To add a “pyright: checked” SVG badge to your project’s README.md file, use the following:
+
+```text
+[![Checked with pyright](https://microsoft.github.io/pyright/img/pyright_badge.svg)](https://microsoft.github.io/pyright/)
+```
 
 ### Running Pyright as a github action
 
@@ -11,6 +21,28 @@ You can configure pyright to run as a github action.
 ```
 
 Refer to the [pyright-action project](https://github.com/jakebailey/pyright-action) for more options.
+
+### Running Pyright in gitlab (with code-quality review)
+
+You can configure pyright to run in gitlab, and generate a compatible codequality report.
+
+```yml
+job_name:
+  before_script:
+    - npm i -g pyright
+    - npm i -g pyright-to-gitlab-ci
+  script:
+   - pyright <python source> --outputjson > report_raw.json
+  after_script:
+   - pyright-to-gitlab-ci --src report_raw.json --output report.json --base_path .
+  artifacts:
+    paths:
+      - report.json
+    reports:
+      codequality: report.json
+```
+
+Refer to the [pyright-to-gitlab-ci](https://www.npmjs.com/package/pyright-to-gitlab-ci) package for more details.
 
 ### Running Pyright as a pre-commit hook
 
@@ -58,7 +90,7 @@ vercomp () {
 # Node version check
 echo "Checking node version..."
 NODE_VERSION=`node -v | cut -d'v' -f2`
-MIN_NODE_VERSION="10.15.2"
+MIN_NODE_VERSION="14.21.3"
 vercomp $MIN_NODE_VERSION $NODE_VERSION
 # 1 == gt
 if [[ $? -eq 1 ]]; then

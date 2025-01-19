@@ -1,5 +1,5 @@
-version = "1.7.*"
+version = "1.7.7"
+upstream_repository = "https://github.com/moses-palmer/pynput"
 
 [tool.stubtest]
-ignore_missing_stub = false
-platforms = ["linux", "darwin", "win32"]
+platforms = ["darwin", "linux", "win32"]

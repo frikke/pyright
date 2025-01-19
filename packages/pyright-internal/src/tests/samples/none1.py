@@ -1,6 +1,6 @@
 # This sample tests properties of the special NoneType.
 
-from typing import Hashable, Iterable, Optional
+from typing import Hashable, Iterable
 
 a: Hashable = None
 
@@ -12,7 +12,7 @@ c.__class__
 c.__doc__
 
 
-def func1(a: Optional[int]):
+def func1(a: int | None):
     a.__class__
     a.__doc__
 
@@ -27,3 +27,5 @@ func2(type(None))
 reveal_type(type(None).__name__, expected_text="str")
 
 _ = type(None) == type(None)
+
+None.__eq__(0)

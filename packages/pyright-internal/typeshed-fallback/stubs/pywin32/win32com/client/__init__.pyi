@@ -1,25 +1,28 @@
 from _typeshed import Incomplete
+from typing import Final
+from typing_extensions import TypeAlias
 
-from win32com.client import dynamic as dynamic
+import _win32typing
+from win32com.client import dynamic
+
+_Stringifiable: TypeAlias = object
 
 def GetObject(Pathname: str | None = ..., Class: Incomplete | None = ..., clsctx: Incomplete | None = ...) -> CDispatch: ...
 def GetActiveObject(Class, clsctx=...): ...
 def Moniker(Pathname, clsctx=...): ...
 def Dispatch(
-    dispatch,
-    userName: Incomplete | None = ...,
-    resultCLSID: Incomplete | None = ...,
-    typeinfo: Incomplete | None = ...,
-    UnicodeToString: Incomplete | None = ...,
-    clsctx=...,
-): ...
+    dispatch: str | dynamic.PyIDispatchType | dynamic._GoodDispatchTypes | dynamic.PyIUnknownType,
+    userName: str | None = ...,
+    resultCLSID: _Stringifiable | None = ...,
+    typeinfo: _win32typing.PyITypeInfo | None = ...,
+    clsctx: int = ...,
+) -> dynamic.CDispatch: ...
 def DispatchEx(
     clsid,
     machine: Incomplete | None = ...,
     userName: Incomplete | None = ...,
     resultCLSID: Incomplete | None = ...,
     typeinfo: Incomplete | None = ...,
-    UnicodeToString: Incomplete | None = ...,
     clsctx: Incomplete | None = ...,
 ): ...
 
@@ -32,7 +35,7 @@ class Constants:
     __dicts__: Incomplete
     def __getattr__(self, a: str): ...
 
-constants: Incomplete
+constants: Final[Constants]
 
 class EventsProxy:
     def __init__(self, ob) -> None: ...
@@ -62,7 +65,7 @@ class CoClassBaseClass:
     def __maybe__int__(self, *args): ...
     def __maybe__iter__(self): ...
     def __maybe__len__(self): ...
-    def __maybe__nonzero__(self): ...
+    def __maybe__bool__(self): ...
 
 class VARIANT:
     varianttype: Incomplete

@@ -11,17 +11,18 @@
 
 import type * as fs from 'fs';
 
-import { getPyTypedInfo } from './analyzer/pyTypedUtils';
+import { PyTypedInfo, getPyTypedInfo } from './analyzer/pyTypedUtils';
 import { ExecutionEnvironment } from './common/configOptions';
 import { FileSystem, MkDirOptions } from './common/fileSystem';
 import { stubsSuffix } from './common/pathConsts';
-import { combinePaths, ensureTrailingDirectorySeparator, isDirectory, tryStat } from './common/pathUtils';
+import { Uri } from './common/uri/uri';
+import { isDirectory, tryStat } from './common/uri/uriUtils';
 import { ReadOnlyAugmentedFileSystem } from './readonlyAugmentedFileSystem';
 
 export interface SupportPartialStubs {
     isPartialStubPackagesScanned(execEnv: ExecutionEnvironment): boolean;
-    isPathScanned(path: string): boolean;
-    processPartialStubPackages(paths: string[], roots: string[], bundledStubPath?: string): void;
+    isPathScanned(path: Uri): boolean;
+    processPartialStubPackages(paths: Uri[], roots: Uri[], bundledStubPath?: Uri): void;
     clearPartialStubs(): void;
 }
 
@@ -36,195 +37,123 @@ export namespace SupportPartialStubs {
     }
 }
 
-export interface SupportUriToPathMapping {
-    hasUriMapEntry(uriString: string, mappedPath: string): boolean;
-    addUriMap(uriString: string, mappedPath: string): boolean;
-    removeUriMap(uriString: string, mappedPath: string): boolean;
-    pendingRequest(mappedPath: string, hasPendingRequest: boolean): void;
-}
+export interface IPyrightFileSystem extends FileSystem, SupportPartialStubs {}
 
-export namespace SupportUriToPathMapping {
-    export function is(value: any): value is SupportUriToPathMapping {
-        return value.hasUriMapEntry && value.addUriMap && value.removeUriMap && value.pendingRequest;
-    }
-}
-
-export class PyrightFileSystem
-    extends ReadOnlyAugmentedFileSystem
-    implements SupportPartialStubs, SupportUriToPathMapping
-{
+export class PyrightFileSystem extends ReadOnlyAugmentedFileSystem implements IPyrightFileSystem {
     // Root paths processed
     private readonly _rootSearched = new Set<string>();
 
     // Partial stub package paths processed
     private readonly _partialStubPackagePaths = new Set<string>();
 
-    private readonly _customUriMap = new Map<string, { uri: string; closed: boolean; hasPendingRequest: boolean }>();
-
     constructor(realFS: FileSystem) {
         super(realFS);
     }
 
-    override mkdirSync(path: string, options?: MkDirOptions): void {
-        this._realFS.mkdirSync(path, options);
+    override mkdirSync(uri: Uri, options?: MkDirOptions): void {
+        this.realFS.mkdirSync(uri, options);
     }
 
-    override chdir(path: string): void {
-        this._realFS.chdir(path);
+    override chdir(uri: Uri): void {
+        this.realFS.chdir(uri);
     }
 
-    override writeFileSync(path: string, data: string | Buffer, encoding: BufferEncoding | null): void {
-        this._realFS.writeFileSync(this._getOriginalPath(path), data, encoding);
+    override writeFileSync(uri: Uri, data: string | Buffer, encoding: BufferEncoding | null): void {
+        this.realFS.writeFileSync(this.getOriginalPath(uri), data, encoding);
     }
 
-    override unlinkSync(path: string): void {
-        this._realFS.unlinkSync(this._getOriginalPath(path));
+    override rmdirSync(uri: Uri): void {
+        this.realFS.rmdirSync(this.getOriginalPath(uri));
     }
 
-    override createWriteStream(path: string): fs.WriteStream {
-        return this._realFS.createWriteStream(this._getOriginalPath(path));
+    override unlinkSync(uri: Uri): void {
+        this.realFS.unlinkSync(this.getOriginalPath(uri));
     }
 
-    override copyFileSync(src: string, dst: string): void {
-        this._realFS.copyFileSync(this._getOriginalPath(src), this._getOriginalPath(dst));
+    override createWriteStream(uri: Uri): fs.WriteStream {
+        return this.realFS.createWriteStream(this.getOriginalPath(uri));
     }
 
-    override getUri(originalPath: string): string {
-        const entry = this._customUriMap.get(this.getMappedFilePath(originalPath));
-        if (entry) {
-            return entry.uri;
-        }
-
-        return this._realFS.getUri(originalPath);
-    }
-
-    hasUriMapEntry(uriString: string, mappedPath: string): boolean {
-        const entry = this._customUriMap.get(mappedPath);
-        if (!entry || entry.uri !== uriString) {
-            // We don't support having 2 uri pointing to same file.
-            return false;
-        }
-
-        return true;
-    }
-
-    addUriMap(uriString: string, mappedPath: string): boolean {
-        const entry = this._customUriMap.get(mappedPath);
-        if (!entry) {
-            this._customUriMap.set(mappedPath, { uri: uriString, closed: false, hasPendingRequest: false });
-            return true;
-        }
-
-        if (entry.uri !== uriString) {
-            // We don't support having 2 uri pointing to same file.
-            return false;
-        }
-
-        entry.closed = false;
-        return true;
-    }
-
-    removeUriMap(uriString: string, mappedPath: string): boolean {
-        const entry = this._customUriMap.get(mappedPath);
-        if (!entry || entry.uri !== uriString) {
-            return false;
-        }
-
-        if (entry.hasPendingRequest) {
-            entry.closed = true;
-            return true;
-        }
-
-        this._customUriMap.delete(mappedPath);
-        return true;
-    }
-
-    pendingRequest(mappedPath: string, hasPendingRequest: boolean): void {
-        const entry = this._customUriMap.get(mappedPath);
-        if (!entry) {
-            return;
-        }
-
-        if (!hasPendingRequest && entry.closed) {
-            this._customUriMap.delete(mappedPath);
-            return;
-        }
-
-        entry.hasPendingRequest = hasPendingRequest;
+    override copyFileSync(src: Uri, dst: Uri): void {
+        this.realFS.copyFileSync(this.getOriginalPath(src), this.getOriginalPath(dst));
     }
 
     isPartialStubPackagesScanned(execEnv: ExecutionEnvironment): boolean {
-        return this.isPathScanned(execEnv.root ?? '');
+        return execEnv.root ? this.isPathScanned(execEnv.root) : false;
     }
 
-    isPathScanned(path: string): boolean {
-        return this._rootSearched.has(path);
+    isPathScanned(uri: Uri): boolean {
+        return this._rootSearched.has(uri.key);
     }
 
-    processPartialStubPackages(paths: string[], roots: string[], bundledStubPath?: string) {
+    processPartialStubPackages(
+        paths: Uri[],
+        roots: Uri[],
+        bundledStubPath?: Uri,
+        allowMoving?: (
+            isBundled: boolean,
+            packagePyTyped: PyTypedInfo | undefined,
+            _stubPyTyped: PyTypedInfo
+        ) => boolean
+    ): void {
+        const allowMovingFn = allowMoving ?? this._allowMoving.bind(this);
         for (const path of paths) {
-            this._rootSearched.add(path);
+            this._rootSearched.add(path.key);
 
-            if (!this._realFS.existsSync(path) || !isDirectory(this._realFS, path)) {
+            if (!this.realFS.existsSync(path) || !isDirectory(this.realFS, path)) {
                 continue;
             }
 
             let dirEntries: fs.Dirent[] = [];
 
             try {
-                dirEntries = this._realFS.readdirEntriesSync(path);
+                dirEntries = this.realFS.readdirEntriesSync(path);
             } catch {
                 // Leave empty set of dir entries to process.
             }
 
-            const isBundledStub = path === bundledStubPath;
+            const isBundledStub = path.equals(bundledStubPath);
             for (const entry of dirEntries) {
-                const partialStubPackagePath = combinePaths(path, entry.name);
+                const partialStubPackagePath = path.combinePaths(entry.name);
                 const isDirectory = !entry.isSymbolicLink()
                     ? entry.isDirectory()
-                    : !!tryStat(this._realFS, partialStubPackagePath)?.isDirectory();
+                    : !!tryStat(this.realFS, partialStubPackagePath)?.isDirectory();
 
                 if (!isDirectory || !entry.name.endsWith(stubsSuffix)) {
                     continue;
                 }
 
-                const pyTypedInfo = getPyTypedInfo(this._realFS, partialStubPackagePath);
+                const pyTypedInfo = getPyTypedInfo(this.realFS, partialStubPackagePath);
                 if (!pyTypedInfo || !pyTypedInfo.isPartiallyTyped) {
                     // Stub-Package is fully typed.
                     continue;
                 }
 
                 // We found partially typed stub-packages.
-                this._partialStubPackagePaths.add(partialStubPackagePath);
+                this._partialStubPackagePaths.add(partialStubPackagePath.key);
 
                 // Search the root to see whether we have matching package installed.
                 let partialStubs: string[] | undefined;
                 const packageName = entry.name.substr(0, entry.name.length - stubsSuffix.length);
                 for (const root of roots) {
-                    const packagePath = combinePaths(root, packageName);
+                    const packagePath = root.combinePaths(packageName);
                     try {
-                        const stat = tryStat(this._realFS, packagePath);
+                        const stat = tryStat(this.realFS, packagePath);
                         if (!stat?.isDirectory()) {
                             continue;
                         }
 
-                        if (isBundledStub) {
-                            // If partial stub we found is from bundled stub and library installed is marked as py.typed
-                            // ignore bundled partial stub.
-                            const packagePyTyped = getPyTypedInfo(this._realFS, packagePath);
-                            if (packagePyTyped && !packagePyTyped.isPartiallyTyped) {
-                                // We have fully typed package.
-                                continue;
-                            }
+                        // If partial stub we found is from bundled stub and library installed is marked as py.typed
+                        // ignore bundled partial stub.
+                        if (!allowMovingFn(isBundledStub, getPyTypedInfo(this.realFS, packagePath), pyTypedInfo)) {
+                            continue;
                         }
-
                         // Merge partial stub packages to the library.
                         partialStubs = partialStubs ?? this._getRelativePathPartialStubs(partialStubPackagePath);
                         for (const partialStub of partialStubs) {
-                            const originalPyiFile = combinePaths(partialStubPackagePath, partialStub);
-                            const mappedPyiFile = combinePaths(packagePath, partialStub);
-
-                            this._recordMovedEntry(mappedPyiFile, originalPyiFile);
+                            const originalPyiFile = partialStubPackagePath.resolvePaths(partialStub);
+                            const mappedPyiFile = packagePath.resolvePaths(partialStub);
+                            this.recordMovedEntry(mappedPyiFile, originalPyiFile, packagePath);
                         }
                     } catch {
                         // ignore
@@ -234,29 +163,41 @@ export class PyrightFileSystem
         }
     }
 
-    override dispose(): void {
-        this._realFS.dispose();
-    }
-
     clearPartialStubs(): void {
-        super._clear();
+        super.clear();
 
         this._rootSearched.clear();
         this._partialStubPackagePaths.clear();
     }
 
-    private _getRelativePathPartialStubs(path: string) {
-        const paths: string[] = [];
+    protected override isMovedEntry(uri: Uri) {
+        return this._partialStubPackagePaths.has(uri.key) || super.isMovedEntry(uri);
+    }
 
-        const partialStubPathLength = ensureTrailingDirectorySeparator(path).length;
-        const searchAllStubs = (path: string) => {
-            for (const entry of this._realFS.readdirEntriesSync(path)) {
-                const filePath = combinePaths(path, entry.name);
+    private _allowMoving(
+        isBundled: boolean,
+        packagePyTyped: PyTypedInfo | undefined,
+        _stubPyTyped: PyTypedInfo
+    ): boolean {
+        if (!isBundled) {
+            return true;
+        }
+
+        // If partial stub we found is from bundled stub and library installed is marked as py.typed
+        // allow moving only if the package is marked as partially typed.
+        return !packagePyTyped || packagePyTyped.isPartiallyTyped;
+    }
+
+    private _getRelativePathPartialStubs(partialStubPath: Uri) {
+        const relativePaths: string[] = [];
+        const searchAllStubs = (uri: Uri) => {
+            for (const entry of this.realFS.readdirEntriesSync(uri)) {
+                const filePath = uri.combinePaths(entry.name);
 
                 let isDirectory = entry.isDirectory();
                 let isFile = entry.isFile();
                 if (entry.isSymbolicLink()) {
-                    const stat = tryStat(this._realFS, filePath);
+                    const stat = tryStat(this.realFS, filePath);
                     if (stat) {
                         isDirectory = stat.isDirectory();
                         isFile = stat.isFile();
@@ -268,19 +209,15 @@ export class PyrightFileSystem
                 }
 
                 if (isFile && entry.name.endsWith('.pyi')) {
-                    const relative = filePath.substring(partialStubPathLength);
+                    const relative = partialStubPath.getRelativePathComponents(filePath).join('/');
                     if (relative) {
-                        paths.push(relative);
+                        relativePaths.push(relative);
                     }
                 }
             }
         };
 
-        searchAllStubs(path);
-        return paths;
-    }
-
-    protected override _isMovedEntry(path: string) {
-        return this._partialStubPackagePaths.has(path) || super._isMovedEntry(path);
+        searchAllStubs(partialStubPath);
+        return relativePaths;
     }
 }

@@ -1,4 +1,9 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
+
+// @filename: pyrightconfig.json
+//// {
+////   "useLibraryCodeForTypes": true
+//// }
 
 // @filename: test.py
 //// import lib
@@ -24,5 +29,5 @@
 //// class A(): pass
 
 helper.verifyHover('markdown', {
-    marker1: '```python\n(class) A()\n```\n---\ndoc string for A',
+    marker1: '```python\nclass A()\n```\n---\ndoc string for A',
 });

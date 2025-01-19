@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: requests/__init__.pyi
 // @library: true
@@ -16,5 +16,5 @@
 //// print(requests.[|/*marker*/head|](''))
 
 helper.verifyHover('markdown', {
-    marker: '```python\n(function) head(url: Unknown, **kwargs: Unknown) -> None\n```\n---\nSends a &lt;HEAD&gt; request.',
+    marker: '```python\n(function) def head(url: Unknown, **kwargs: Unknown) -> None\n```\n---\nSends a &lt;HEAD&gt; request.',
 });

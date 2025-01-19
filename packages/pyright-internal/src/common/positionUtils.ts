@@ -8,6 +8,7 @@
  * line/column positions.
  */
 
+import { TokenizerOutput } from '../parser/tokenizer';
 import { assert } from './debug';
 import { Position, Range, TextRange } from './textRange';
 import { TextRangeCollection } from './textRangeCollection';
@@ -22,20 +23,13 @@ export function convertOffsetToPosition(offset: number, lines: TextRangeCollecti
         };
     }
 
-    // Handle the case where we're pointing to the last line of the file.
-    let offsetAdjustment = 0;
-    if (offset >= lines.end) {
-        offset = lines.end - 1;
-        offsetAdjustment = 1;
-    }
-
-    const itemIndex = lines.getItemContaining(offset);
-    assert(itemIndex >= 0 && itemIndex <= lines.length);
+    const itemIndex = offset >= lines.end ? lines.count - 1 : lines.getItemContaining(offset);
+    assert(itemIndex >= 0 && itemIndex <= lines.count);
     const lineRange = lines.getItemAt(itemIndex);
     assert(lineRange !== undefined);
     return {
         line: itemIndex,
-        character: offset - lineRange.start + offsetAdjustment,
+        character: Math.max(0, Math.min(lineRange.length, offset - lineRange.start)),
     };
 }
 
@@ -75,4 +69,27 @@ export function convertRangeToTextRange(range: Range, lines: TextRangeCollection
 
 export function convertTextRangeToRange(range: TextRange, lines: TextRangeCollection<TextRange>): Range {
     return convertOffsetsToRange(range.start, TextRange.getEnd(range), lines);
+}
+
+// Returns the position of the last character in a line (before the newline).
+export function getLineEndPosition(tokenizerOutput: TokenizerOutput, text: string, line: number): Position {
+    return convertOffsetToPosition(getLineEndOffset(tokenizerOutput, text, line), tokenizerOutput.lines);
+}
+
+export function getLineEndOffset(tokenizerOutput: TokenizerOutput, text: string, line: number): number {
+    const lineRange = tokenizerOutput.lines.getItemAt(line);
+
+    const lineEndOffset = TextRange.getEnd(lineRange);
+    let newLineLength = 0;
+    for (let i = lineEndOffset - 1; i >= lineRange.start; i--) {
+        const char = text[i];
+        if (char !== '\r' && char !== '\n') {
+            break;
+        }
+
+        newLineLength++;
+    }
+
+    // Character should be at the end of the line but before the newline.
+    return lineEndOffset - newLineLength;
 }

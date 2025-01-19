@@ -5,9 +5,7 @@
  * Licensed under the MIT license.
  * Author: Eric Traut
  *
- * This wraps real type evaluator to track performance information such
- * as which type inferring takes most of time, what files are read most of times
- * and etc.
+ * Wraps type evaluator to track performance of internal calls.
  */
 
 import { LogLevel } from '../common/console';
@@ -26,8 +24,8 @@ export function createTypeEvaluatorWithTracker(
     printer?: TracePrinter
 ) {
     function wrapWithLogger<T extends (...args: any[]) => any>(func: T): (...args: Parameters<T>) => ReturnType<T> {
-        // Only wrap the function if told to do so and the log level is high enough for it
-        // to actually log something.
+        // Wrap the function only if told to do so and the log level is high
+        // enough for it to log something.
         if (evaluatorOptions.logCalls && logger.logLevel === LogLevel.Log) {
             return (...args: Parameters<T>): ReturnType<T> => {
                 return logger.log(
@@ -57,11 +55,14 @@ export function createTypeEvaluatorWithTracker(
 
     // Wrap all functions with either a logger or a timer.
     importLookup = wrapWithLogger(importLookup);
-    const evaluator = createTypeEvaluator(importLookup, evaluatorOptions);
+    const evaluator = createTypeEvaluator(importLookup, evaluatorOptions, wrapWithLogger);
+
+    // Track these apis external usages when logging is on. otherwise, it should be noop.
     const keys = Object.keys(evaluator);
     keys.forEach((k) => {
         const entry = (evaluator as any)[k];
-        if (typeof entry === 'function') {
+        if (typeof entry === 'function' && entry.name) {
+            // Only wrap functions that aren't wrapped already.
             (evaluator as any)[k] = wrapWithLogger(entry);
         }
     });

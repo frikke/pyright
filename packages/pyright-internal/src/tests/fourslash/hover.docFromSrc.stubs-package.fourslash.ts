@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: package1-stubs/__init__.pyi
 // @library: true
@@ -24,6 +24,6 @@
 //// print(package1.[|/*marker*/func1|]())
 
 helper.verifyHover('markdown', {
-    marker: '```python\n(function) func1() -> bool\n```\n---\nfunc1 docs',
-    marker2: '```python\n(function) func2() -> bool\n```\n---\nfunc2 docs',
+    marker: '```python\n(function) def func1() -> bool\n```\n---\nfunc1 docs',
+    marker2: '```python\n(function) def func2() -> bool\n```\n---\nfunc2 docs',
 });

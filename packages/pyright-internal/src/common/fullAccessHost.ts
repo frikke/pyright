@@ -7,14 +7,19 @@
  */
 
 import * as child_process from 'child_process';
+import { CancellationToken } from 'vscode-languageserver';
 
 import { PythonPathResult } from '../analyzer/pythonPathUtils';
+import { OperationCanceledException, onCancellationRequested, throwIfCancellationRequested } from './cancellationUtils';
 import { PythonPlatform } from './configOptions';
 import { assertNever } from './debug';
-import { FileSystem } from './fileSystem';
-import { HostKind, NoAccessHost } from './host';
-import { isDirectory, normalizePath } from './pathUtils';
-import { PythonVersion, versionFromMajorMinor } from './pythonVersion';
+import { HostKind, NoAccessHost, ScriptOutput } from './host';
+import { getAnyExtensionFromPath, normalizePath } from './pathUtils';
+import { PythonVersion } from './pythonVersion';
+import { ServiceKeys } from './serviceKeys';
+import { ServiceProvider } from './serviceProvider';
+import { Uri } from './uri/uri';
+import { isDirectory } from './uri/uriUtils';
 
 // preventLocalImports removes the working directory from sys.path.
 // The -c flag adds it automatically, which can allow some stdlib
@@ -36,7 +41,7 @@ const extractSys = [
 const extractVersion = [
     ...removeCwdFromSysPath,
     'import sys, json',
-    'json.dump(dict(major=sys.version_info[0], minor=sys.version_info[1]), sys.stdout)',
+    'json.dump(tuple(sys.version_info), sys.stdout)',
 ].join('; ');
 
 export class LimitedAccessHost extends NoAccessHost {
@@ -58,20 +63,7 @@ export class LimitedAccessHost extends NoAccessHost {
 }
 
 export class FullAccessHost extends LimitedAccessHost {
-    static createHost(kind: HostKind, fs: FileSystem) {
-        switch (kind) {
-            case HostKind.NoAccess:
-                return new NoAccessHost();
-            case HostKind.LimitedAccess:
-                return new LimitedAccessHost();
-            case HostKind.FullAccess:
-                return new FullAccessHost(fs);
-            default:
-                assertNever(kind);
-        }
-    }
-
-    constructor(protected _fs: FileSystem) {
+    constructor(protected serviceProvider: ServiceProvider) {
         super();
     }
 
@@ -79,16 +71,29 @@ export class FullAccessHost extends LimitedAccessHost {
         return HostKind.FullAccess;
     }
 
-    override getPythonSearchPaths(pythonPath?: string, logInfo?: string[]): PythonPathResult {
+    static createHost(kind: HostKind, serviceProvider: ServiceProvider) {
+        switch (kind) {
+            case HostKind.NoAccess:
+                return new NoAccessHost();
+            case HostKind.LimitedAccess:
+                return new LimitedAccessHost();
+            case HostKind.FullAccess:
+                return new FullAccessHost(serviceProvider);
+            default:
+                assertNever(kind);
+        }
+    }
+
+    override getPythonSearchPaths(pythonPath?: Uri, logInfo?: string[]): PythonPathResult {
         const importFailureInfo = logInfo ?? [];
-        let result = this._executePythonInterpreter(pythonPath, (p) =>
-            this._getSearchPathResultFromInterpreter(this._fs, p, importFailureInfo)
+        let result = this._executePythonInterpreter(pythonPath?.getFilePath(), (p) =>
+            this._getSearchPathResultFromInterpreter(p, importFailureInfo)
         );
 
         if (!result) {
             result = {
                 paths: [],
-                prefix: '',
+                prefix: undefined,
             };
         }
 
@@ -100,21 +105,31 @@ export class FullAccessHost extends LimitedAccessHost {
         return result;
     }
 
-    override getPythonVersion(pythonPath?: string, logInfo?: string[]): PythonVersion | undefined {
+    override getPythonVersion(pythonPath?: Uri, logInfo?: string[]): PythonVersion | undefined {
         const importFailureInfo = logInfo ?? [];
 
         try {
-            const commandLineArgs: string[] = ['-c', extractVersion];
-            const execOutput = this._executePythonInterpreter(pythonPath, (p) =>
-                child_process.execFileSync(p, commandLineArgs, { encoding: 'utf8' })
+            const execOutput = this._executePythonInterpreter(pythonPath?.getFilePath(), (p) =>
+                this._executeCodeInInterpreter(p, ['-I'], extractVersion)
             );
 
-            const versionJson: { major: number; minor: number } = JSON.parse(execOutput!);
-            const version = versionFromMajorMinor(versionJson.major, versionJson.minor);
+            const versionJson: any[] = JSON.parse(execOutput!);
+
+            if (!Array.isArray(versionJson) || versionJson.length < 5) {
+                importFailureInfo.push(`Python version ${execOutput} from interpreter is unexpected format`);
+                return undefined;
+            }
+
+            const version = PythonVersion.create(
+                versionJson[0],
+                versionJson[1],
+                versionJson[2],
+                versionJson[3],
+                versionJson[4]
+            );
+
             if (version === undefined) {
-                importFailureInfo.push(
-                    `Python version ${versionJson.major}.${versionJson.minor} from interpreter is unsupported`
-                );
+                importFailureInfo.push(`Python version ${execOutput} from interpreter is unsupported`);
                 return undefined;
             }
 
@@ -123,6 +138,72 @@ export class FullAccessHost extends LimitedAccessHost {
             importFailureInfo.push('Unable to get Python version from interpreter');
             return undefined;
         }
+    }
+
+    override runScript(
+        pythonPath: Uri | undefined,
+        script: Uri,
+        args: string[],
+        cwd: Uri,
+        token: CancellationToken
+    ): Promise<ScriptOutput> {
+        // If it is already cancelled, don't bother to run script.
+        throwIfCancellationRequested(token);
+
+        // What to do about conda here?
+        return new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+            let stdout = '';
+            let stderr = '';
+            const commandLineArgs = ['-I', script.getFilePath(), ...args];
+
+            const child = this._executePythonInterpreter(pythonPath?.getFilePath(), (p) =>
+                child_process.spawn(p, commandLineArgs, {
+                    cwd: cwd.getFilePath(),
+                    shell: this.shouldUseShellToRunInterpreter(p),
+                })
+            );
+            const tokenWatch = onCancellationRequested(token, () => {
+                if (child) {
+                    try {
+                        if (child.pid && child.exitCode === null) {
+                            if (process.platform === 'win32') {
+                                // Windows doesn't support SIGTERM, so execute taskkill to kill the process
+                                child_process.execSync(`taskkill /pid ${child.pid} /T /F > NUL 2>&1`);
+                            } else {
+                                process.kill(child.pid);
+                            }
+                        }
+                    } catch {
+                        // Ignore.
+                    }
+                }
+                reject(new OperationCanceledException());
+            });
+            if (child) {
+                child.stdout.on('data', (d) => (stdout = stdout.concat(d)));
+                child.stderr.on('data', (d) => (stderr = stderr.concat(d)));
+                child.on('error', (e) => {
+                    tokenWatch.dispose();
+                    reject(e);
+                });
+                child.on('exit', () => {
+                    tokenWatch.dispose();
+                    resolve({ stdout, stderr });
+                });
+            } else {
+                tokenWatch.dispose();
+                reject(new Error(`Cannot start python interpreter with script ${script}`));
+            }
+        });
+    }
+
+    protected shouldUseShellToRunInterpreter(interpreterPath: string): boolean {
+        // Windows bat/cmd files must me executed with the shell due to the following breaking change:
+        // https://nodejs.org/en/blog/vulnerability/april-2024-security-releases-2#command-injection-via-args-parameter-of-child_processspawn-without-shell-option-enabled-on-windows-cve-2024-27980---high
+        return (
+            process.platform === 'win32' &&
+            !!getAnyExtensionFromPath(interpreterPath, ['.bat', '.cmd'], /* ignoreCase */ true)
+        );
     }
 
     private _executePythonInterpreter<T>(
@@ -153,21 +234,41 @@ export class FullAccessHost extends LimitedAccessHost {
         }
     }
 
+    /**
+     * Executes a chunk of Python code via the provided interpreter and returns the output.
+     * @param interpreterPath Path to interpreter.
+     * @param commandLineArgs Command line args for interpreter other than the code to execute.
+     * @param code Code to execute.
+     */
+    private _executeCodeInInterpreter(interpreterPath: string, commandLineArgs: string[], code: string): string {
+        const useShell = this.shouldUseShellToRunInterpreter(interpreterPath);
+        if (useShell) {
+            code = '"' + code + '"';
+        }
+
+        commandLineArgs.push('-c', code);
+
+        const execOutput = child_process.execFileSync(interpreterPath, commandLineArgs, {
+            encoding: 'utf8',
+            shell: useShell,
+        });
+
+        return execOutput;
+    }
+
     private _getSearchPathResultFromInterpreter(
-        fs: FileSystem,
-        interpreter: string,
+        interpreterPath: string,
         importFailureInfo: string[]
     ): PythonPathResult | undefined {
         const result: PythonPathResult = {
             paths: [],
-            prefix: '',
+            prefix: undefined,
         };
 
         try {
-            const commandLineArgs: string[] = ['-c', extractSys];
-
-            importFailureInfo.push(`Executing interpreter: '${interpreter}'`);
-            const execOutput = child_process.execFileSync(interpreter, commandLineArgs, { encoding: 'utf8' });
+            importFailureInfo.push(`Executing interpreter: '${interpreterPath}'`);
+            const execOutput = this._executeCodeInInterpreter(interpreterPath, [], extractSys);
+            const caseDetector = this.serviceProvider.get(ServiceKeys.caseSensitivityDetector);
 
             // Parse the execOutput. It should be a JSON-encoded array of paths.
             try {
@@ -176,16 +277,20 @@ export class FullAccessHost extends LimitedAccessHost {
                     execSplitEntry = execSplitEntry.trim();
                     if (execSplitEntry) {
                         const normalizedPath = normalizePath(execSplitEntry);
+                        const normalizedUri = Uri.file(normalizedPath, caseDetector);
                         // Skip non-existent paths and broken zips/eggs.
-                        if (fs.existsSync(normalizedPath) && isDirectory(fs, normalizedPath)) {
-                            result.paths.push(normalizedPath);
+                        if (
+                            this.serviceProvider.fs().existsSync(normalizedUri) &&
+                            isDirectory(this.serviceProvider.fs(), normalizedUri)
+                        ) {
+                            result.paths.push(normalizedUri);
                         } else {
                             importFailureInfo.push(`Skipping '${normalizedPath}' because it is not a valid directory`);
                         }
                     }
                 }
 
-                result.prefix = execSplit.prefix;
+                result.prefix = Uri.file(execSplit.prefix, caseDetector);
 
                 if (result.paths.length === 0) {
                     importFailureInfo.push(`Found no valid directories`);

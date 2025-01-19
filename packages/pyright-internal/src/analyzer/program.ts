@@ -8,125 +8,51 @@
  * and all of their recursive imports.
  */
 
-import { CancellationToken, CompletionItem, DocumentSymbol } from 'vscode-languageserver';
-import { TextDocumentContentChangeEvent } from 'vscode-languageserver-textdocument';
-import {
-    CallHierarchyIncomingCall,
-    CallHierarchyItem,
-    CallHierarchyOutgoingCall,
-    CompletionList,
-    DocumentHighlight,
-    MarkupKind,
-} from 'vscode-languageserver-types';
+import { CancellationToken } from 'vscode-languageserver';
 
+import { TextDocument } from 'vscode-languageserver-textdocument';
 import { OperationCanceledException, throwIfCancellationRequested } from '../common/cancellationUtils';
-import { appendArray } from '../common/collectionUtils';
-import { ConfigOptions, ExecutionEnvironment } from '../common/configOptions';
+import { ConfigOptions, ExecutionEnvironment, matchFileSpecs } from '../common/configOptions';
 import { ConsoleInterface, StandardConsole } from '../common/console';
-import { assert, assertNever } from '../common/debug';
-import { Diagnostic } from '../common/diagnostic';
+import * as debug from '../common/debug';
+import { assert } from '../common/debug';
+import { Diagnostic, DiagnosticCategory } from '../common/diagnostic';
 import { FileDiagnostics } from '../common/diagnosticSink';
-import { FileEditAction, FileEditActions, TextEditAction } from '../common/editAction';
-import { LanguageServiceExtension } from '../common/extensibility';
+import { FileEditAction } from '../common/editAction';
+import { EditableProgram, ProgramView } from '../common/extensibility';
 import { LogTracker } from '../common/logTracker';
-import {
-    combinePaths,
-    getDirectoryPath,
-    getFileName,
-    getRelativePath,
-    isFile,
-    makeDirectories,
-    normalizePath,
-    normalizePathCase,
-    stripFileExtension,
-} from '../common/pathUtils';
-import { convertPositionToOffset, convertRangeToTextRange, convertTextRangeToRange } from '../common/positionUtils';
-import { computeCompletionSimilarity } from '../common/stringUtils';
-import { DocumentRange, doesRangeContain, doRangesIntersect, Position, Range } from '../common/textRange';
+import { convertRangeToTextRange } from '../common/positionUtils';
+import { ServiceKeys } from '../common/serviceKeys';
+import { ServiceProvider } from '../common/serviceProvider';
+import '../common/serviceProviderExtensions';
+import { Range, doRangesIntersect } from '../common/textRange';
 import { Duration, timingStats } from '../common/timing';
-import {
-    AutoImporter,
-    AutoImportOptions,
-    AutoImportResult,
-    buildModuleSymbolsMap,
-    ModuleSymbolMap,
-} from '../languageService/autoImporter';
-import { CallHierarchyProvider } from '../languageService/callHierarchyProvider';
-import {
-    AbbreviationMap,
-    CompletionMap,
-    CompletionOptions,
-    CompletionResultsList,
-} from '../languageService/completionProvider';
-import { DefinitionFilter } from '../languageService/definitionProvider';
-import { DocumentSymbolCollector } from '../languageService/documentSymbolCollector';
-import { IndexOptions, IndexResults, WorkspaceSymbolCallback } from '../languageService/documentSymbolProvider';
-import { HoverResults } from '../languageService/hoverProvider';
-import { ReferenceCallback, ReferencesResult } from '../languageService/referencesProvider';
-import { RenameModuleProvider } from '../languageService/renameModuleProvider';
-import { SignatureHelpResults } from '../languageService/signatureHelpProvider';
-import { ParseNodeType } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
-import { AbsoluteModuleDescriptor, ImportLookupResult } from './analyzerFileInfo';
+import { Uri } from '../common/uri/uri';
+import { makeDirectories } from '../common/uri/uriUtils';
+import { ParseFileResults, ParserOutput } from '../parser/parser';
+import { RequiringAnalysisCount } from './analysis';
+import { AbsoluteModuleDescriptor, ImportLookupResult, LookupImportOptions } from './analyzerFileInfo';
 import * as AnalyzerNodeInfo from './analyzerNodeInfo';
 import { CacheManager } from './cacheManager';
 import { CircularDependency } from './circularDependency';
-import { Declaration } from './declaration';
 import { ImportResolver } from './importResolver';
 import { ImportResult, ImportType } from './importResult';
-import { findNodeByOffset, getDocString } from './parseTreeUtils';
+import { getDocString } from './parseTreeUtils';
+import { ISourceFileFactory } from './programTypes';
 import { Scope } from './scope';
-import { getScopeForNode } from './scopeUtils';
 import { IPythonMode, SourceFile } from './sourceFile';
-import { isUserCode } from './sourceFileInfoUtils';
-import { isStubFile, SourceMapper } from './sourceMapper';
+import { SourceFileInfo } from './sourceFileInfo';
+import { createChainedByList, isUserCode, verifyNoCyclesInChainedFiles } from './sourceFileInfoUtils';
+import { SourceMapper } from './sourceMapper';
 import { Symbol } from './symbol';
-import { isPrivateOrProtectedName } from './symbolNameUtils';
 import { createTracePrinter } from './tracePrinter';
 import { PrintTypeOptions, TypeEvaluator } from './typeEvaluatorTypes';
 import { createTypeEvaluatorWithTracker } from './typeEvaluatorWithTracker';
 import { PrintTypeFlags } from './typePrinter';
-import { Type } from './types';
 import { TypeStubWriter } from './typeStubWriter';
+import { Type } from './types';
 
 const _maxImportDepth = 256;
-
-export const MaxWorkspaceIndexFileCount = 2000;
-
-// Tracks information about each source file in a program,
-// including the reason it was added to the program and any
-// dependencies that it has on other files in the program.
-export interface SourceFileInfo {
-    // Reference to the source file
-    sourceFile: SourceFile;
-
-    // Information about the source file
-    isTypeshedFile: boolean;
-    isThirdPartyImport: boolean;
-    isThirdPartyPyTypedPresent: boolean;
-    diagnosticsVersion?: number | undefined;
-
-    builtinsImport?: SourceFileInfo | undefined;
-    ipythonDisplayImport?: SourceFileInfo | undefined;
-
-    // Information about the chained source file
-    // Chained source file is not supposed to exist on file system but
-    // must exist in the program's source file list. Module level
-    // scope of the chained source file will be inserted before
-    // current file's scope.
-    chainedSourceFile?: SourceFileInfo | undefined;
-
-    effectiveFutureImports?: Set<string>;
-
-    // Information about why the file is included in the program
-    // and its relation to other source files in the program.
-    isTracked: boolean;
-    isOpenByClient: boolean;
-    imports: SourceFileInfo[];
-    importedBy: SourceFileInfo[];
-    shadows: SourceFileInfo[];
-    shadowedBy: SourceFileInfo[];
-}
 
 export interface MaxAnalysisTime {
     // Maximum number of ms to analyze when there are open files
@@ -141,25 +67,47 @@ export interface MaxAnalysisTime {
     noOpenFilesTimeInMs: number;
 }
 
-export interface Indices {
-    setWorkspaceIndex(path: string, indexResults: IndexResults): void;
-    getIndex(execEnv: string | undefined): Map<string, IndexResults> | undefined;
-}
-
 interface UpdateImportInfo {
-    path: string;
+    path: Uri;
     isTypeshedFile: boolean;
     isThirdPartyImport: boolean;
     isPyTypedPresent: boolean;
 }
 
-export type PreCheckCallback = (parseResults: ParseResults, evaluator: TypeEvaluator) => void;
+export type PreCheckCallback = (parserOutput: ParserOutput, evaluator: TypeEvaluator) => void;
 
 export interface OpenFileOptions {
     isTracked: boolean;
     ipythonMode: IPythonMode;
-    chainedFilePath: string | undefined;
-    realFilePath: string | undefined;
+    chainedFileUri: Uri | undefined;
+}
+
+// Track edit mode related information.
+class EditModeTracker {
+    private _isEditMode = false;
+    private _mutatedFiles: SourceFileInfo[] = [];
+
+    get isEditMode() {
+        return this._isEditMode;
+    }
+
+    addMutatedFiles(file: SourceFileInfo) {
+        this._mutatedFiles.push(file);
+    }
+
+    enable() {
+        this._isEditMode = true;
+        this._mutatedFiles = [];
+    }
+
+    disable() {
+        this._isEditMode = false;
+
+        const files = this._mutatedFiles;
+        this._mutatedFiles = [];
+
+        return files;
+    }
 }
 
 // Container for all of the files that are being analyzed. Files
@@ -169,48 +117,146 @@ export interface OpenFileOptions {
 //  Opened - temporarily opened in the editor
 //  Shadowed - implementation file that shadows a type stub file
 export class Program {
-    private _console: ConsoleInterface;
-    private _sourceFileList: SourceFileInfo[] = [];
-    private _sourceFileMap = new Map<string, SourceFileInfo>();
+    private static _nextId = 0;
+
+    private readonly _console: ConsoleInterface;
+    private readonly _sourceFileList: SourceFileInfo[] = [];
+    private readonly _sourceFileMap = new Map<string, SourceFileInfo>();
+
+    private readonly _logTracker: LogTracker;
+    private readonly _cacheManager: CacheManager;
+    private readonly _id: string;
+
     private _allowedThirdPartyImports: string[] | undefined;
-    private _evaluator: TypeEvaluator | undefined;
     private _configOptions: ConfigOptions;
     private _importResolver: ImportResolver;
-    private _logTracker: LogTracker;
+    private _evaluator: TypeEvaluator | undefined;
+
     private _parsedFileCount = 0;
     private _preCheckCallback: PreCheckCallback | undefined;
-    private _cacheManager: CacheManager;
+    private _editModeTracker = new EditModeTracker();
+    private _sourceFileFactory: ISourceFileFactory;
 
     constructor(
         initialImportResolver: ImportResolver,
         initialConfigOptions: ConfigOptions,
-        console?: ConsoleInterface,
-        private _extension?: LanguageServiceExtension,
+        readonly serviceProvider: ServiceProvider,
         logTracker?: LogTracker,
         private _disableChecker?: boolean,
-        cacheManager?: CacheManager
+        id?: string
     ) {
-        this._console = console || new StandardConsole();
-        this._logTracker = logTracker ?? new LogTracker(console, 'FG');
+        this._console = serviceProvider.tryGet(ServiceKeys.console) || new StandardConsole();
+        this._logTracker = logTracker ?? new LogTracker(this._console, 'FG');
         this._importResolver = initialImportResolver;
         this._configOptions = initialConfigOptions;
 
-        this._cacheManager = cacheManager ?? new CacheManager();
-        this._cacheManager.registerCacheOwner(this);
+        this._sourceFileFactory = serviceProvider.sourceFileFactory();
 
+        this._cacheManager = serviceProvider.tryGet(ServiceKeys.cacheManager) ?? new CacheManager();
+        this._cacheManager.registerCacheOwner(this);
         this._createNewEvaluator();
+
+        this._id = id ?? `Prog_${Program._nextId}`;
+        Program._nextId += 1;
     }
 
-    dispose() {
-        this._cacheManager.unregisterCacheOwner(this);
+    get id() {
+        return this._id;
+    }
+
+    get console(): ConsoleInterface {
+        return this._console;
+    }
+
+    get rootPath(): Uri {
+        return this._configOptions.projectRoot;
     }
 
     get evaluator(): TypeEvaluator | undefined {
         return this._evaluator;
     }
 
+    get configOptions(): ConfigOptions {
+        return this._configOptions;
+    }
+
+    get importResolver(): ImportResolver {
+        return this._importResolver;
+    }
+
+    get fileSystem() {
+        return this._importResolver.fileSystem;
+    }
+
+    dispose() {
+        this._cacheManager.unregisterCacheOwner(this);
+    }
+
+    enterEditMode() {
+        this._editModeTracker.enable();
+    }
+
+    exitEditMode() {
+        // Stop applying edit mode to new source files.
+        const mutatedFiles = this._editModeTracker.disable();
+
+        const filesToDelete = new Set<SourceFileInfo>();
+        const edits: FileEditAction[] = [];
+
+        // Tell all source files we're no longer in edit mode. Gather
+        // up all of their edits and find files that no longer needed.
+        mutatedFiles.forEach((fileInfo) => {
+            if (fileInfo.isCreatedInEditMode) {
+                filesToDelete.add(fileInfo);
+            }
+
+            const newContents = fileInfo.restore();
+            if (newContents) {
+                // Create a text document so we can compute the edits.
+                const textDocument = TextDocument.create(
+                    fileInfo.sourceFile.getUri().toString(),
+                    'python',
+                    1,
+                    fileInfo.sourceFile.getFileContent() || ''
+                );
+
+                // Add an edit action to the list.
+                edits.push({
+                    fileUri: fileInfo.sourceFile.getUri(),
+                    range: {
+                        start: { line: 0, character: 0 },
+                        end: { line: textDocument.lineCount, character: 0 },
+                    },
+                    replacementText: newContents,
+                });
+            }
+        });
+
+        // Delete files added while in edit mode
+        if (filesToDelete.size > 0) {
+            // delete from the back to make sure index is valid.
+            for (let i = this._sourceFileList.length - 1; i >= 0; i--) {
+                const v = this._sourceFileList[i];
+                if (filesToDelete.has(v)) {
+                    // We don't need to care about file diagnostics since in edit mode
+                    // checker won't run.
+                    v.sourceFile.prepareForClose();
+                    this._removeSourceFileFromListAndMap(v.sourceFile.getUri(), i);
+                }
+            }
+        }
+
+        if (mutatedFiles.length > 0) {
+            // All cache is invalid now.
+            this._createNewEvaluator();
+        }
+
+        return edits;
+    }
+
     setConfigOptions(configOptions: ConfigOptions) {
         this._configOptions = configOptions;
+        this._importResolver.setConfigOptions(configOptions);
 
         // Create a new evaluator with the updated config options.
         this._createNewEvaluator();
@@ -226,26 +272,26 @@ export class Program {
     }
 
     // Sets the list of tracked files that make up the program.
-    setTrackedFiles(filePaths: string[]): FileDiagnostics[] {
+    setTrackedFiles(fileUris: Uri[]): FileDiagnostics[] {
         if (this._sourceFileList.length > 0) {
             // We need to determine which files to remove from the existing file list.
-            const newFileMap = new Map<string, string>();
-            filePaths.forEach((path) => {
-                newFileMap.set(normalizePathCase(this._fs, path), path);
+            const newFileMap = new Map<string, Uri>();
+            fileUris.forEach((path) => {
+                newFileMap.set(path.key, path);
             });
 
             // Files that are not in the tracked file list are
             // marked as no longer tracked.
             this._sourceFileList.forEach((oldFile) => {
-                const filePath = normalizePathCase(this._fs, oldFile.sourceFile.getFilePath());
-                if (!newFileMap.has(filePath)) {
+                const fileUri = oldFile.sourceFile.getUri();
+                if (!newFileMap.has(fileUri.key)) {
                     oldFile.isTracked = false;
                 }
             });
         }
 
         // Add the new files. Only the new items will be added.
-        this.addTrackedFiles(filePaths);
+        this.addTrackedFiles(fileUris);
 
         return this._removeUnneededFiles();
     }
@@ -265,15 +311,26 @@ export class Program {
         this._allowedThirdPartyImports = importNames;
     }
 
-    addTrackedFiles(filePaths: string[], isThirdPartyImport = false, isInPyTypedPackage = false) {
-        filePaths.forEach((filePath) => {
-            this.addTrackedFile(filePath, isThirdPartyImport, isInPyTypedPackage);
+    addTrackedFiles(fileUris: Uri[], isThirdPartyImport = false, isInPyTypedPackage = false) {
+        fileUris.forEach((fileUri) => {
+            this.addTrackedFile(fileUri, isThirdPartyImport, isInPyTypedPackage);
         });
     }
 
-    addTrackedFile(filePath: string, isThirdPartyImport = false, isInPyTypedPackage = false): SourceFile {
-        let sourceFileInfo = this.getSourceFileInfo(filePath);
-        const importName = this._getImportNameForFile(filePath);
+    addInterimFile(fileUri: Uri): SourceFileInfo {
+        // Double check not already there.
+        let fileInfo = this.getSourceFileInfo(fileUri);
+        if (!fileInfo) {
+            fileInfo = this._createInterimFileInfo(fileUri);
+            this._addToSourceFileListAndMap(fileInfo);
+        }
+        return fileInfo;
+    }
+
+    addTrackedFile(fileUri: Uri, isThirdPartyImport = false, isInPyTypedPackage = false): SourceFile {
+        let sourceFileInfo = this.getSourceFileInfo(fileUri);
+        const moduleImportInfo = this._getModuleImportInfoForFile(fileUri);
+        const importName = moduleImportInfo.moduleName;
 
         if (sourceFileInfo) {
             // The module name may have changed based on updates to the
@@ -283,68 +340,58 @@ export class Program {
             return sourceFileInfo.sourceFile;
         }
 
-        const sourceFile = new SourceFile(
-            this._fs,
-            filePath,
+        const sourceFile = this._sourceFileFactory.createSourceFile(
+            this.serviceProvider,
+            fileUri,
             importName,
             isThirdPartyImport,
             isInPyTypedPackage,
+            this._editModeTracker,
             this._console,
             this._logTracker
         );
-        sourceFileInfo = {
+        sourceFileInfo = new SourceFileInfo(
             sourceFile,
-            isTracked: true,
-            isOpenByClient: false,
-            isTypeshedFile: false,
+            /* isTypeshedFile */ false,
             isThirdPartyImport,
-            isThirdPartyPyTypedPresent: isInPyTypedPackage,
-            diagnosticsVersion: undefined,
-            imports: [],
-            importedBy: [],
-            shadows: [],
-            shadowedBy: [],
-        };
+            isInPyTypedPackage,
+            this._editModeTracker,
+            {
+                isTracked: true,
+            }
+        );
         this._addToSourceFileListAndMap(sourceFileInfo);
         return sourceFile;
     }
 
-    setFileOpened(
-        filePath: string,
-        version: number | null,
-        contents: TextDocumentContentChangeEvent[],
-        options?: OpenFileOptions
-    ) {
-        let sourceFileInfo = this.getSourceFileInfo(filePath);
+    setFileOpened(fileUri: Uri, version: number | null, contents: string, options?: OpenFileOptions) {
+        let sourceFileInfo = this.getSourceFileInfo(fileUri);
         if (!sourceFileInfo) {
-            const importName = this._getImportNameForFile(filePath);
-            const sourceFile = new SourceFile(
-                this._fs,
-                filePath,
-                importName,
+            const moduleImportInfo = this._getModuleImportInfoForFile(fileUri);
+            const sourceFile = this._sourceFileFactory.createSourceFile(
+                this.serviceProvider,
+                fileUri,
+                moduleImportInfo.moduleName,
                 /* isThirdPartyImport */ false,
-                /* isInPyTypedPackage */ false,
+                moduleImportInfo.isThirdPartyPyTypedPresent,
+                this._editModeTracker,
                 this._console,
                 this._logTracker,
-                options?.realFilePath,
                 options?.ipythonMode ?? IPythonMode.None
             );
-
-            const chainedFilePath = options?.chainedFilePath;
-            sourceFileInfo = {
+            const chainedFilePath = options?.chainedFileUri;
+            sourceFileInfo = new SourceFileInfo(
                 sourceFile,
-                isTracked: options?.isTracked ?? false,
-                chainedSourceFile: chainedFilePath ? this.getSourceFileInfo(chainedFilePath) : undefined,
-                isOpenByClient: true,
-                isTypeshedFile: false,
-                isThirdPartyImport: false,
-                isThirdPartyPyTypedPresent: false,
-                diagnosticsVersion: undefined,
-                imports: [],
-                importedBy: [],
-                shadows: [],
-                shadowedBy: [],
-            };
+                /* isTypeshedFile */ false,
+                /* isThirdPartyImport */ false,
+                /* isThirdPartyPyTypedPresent */ false,
+                this._editModeTracker,
+                {
+                    isTracked: options?.isTracked ?? false,
+                    chainedSourceFile: chainedFilePath ? this.getSourceFileInfo(chainedFilePath) : undefined,
+                    isOpenByClient: true,
+                }
+            );
             this._addToSourceFileListAndMap(sourceFileInfo);
         } else {
             sourceFileInfo.isOpenByClient = true;
@@ -356,30 +403,34 @@ export class Program {
             sourceFileInfo.diagnosticsVersion = 0;
         }
 
+        verifyNoCyclesInChainedFiles(this, sourceFileInfo);
         sourceFileInfo.sourceFile.setClientVersion(version, contents);
     }
 
-    getChainedFilePath(filePath: string): string | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        return sourceFileInfo?.chainedSourceFile?.sourceFile.getFilePath();
+    getChainedUri(fileUri: Uri): Uri | undefined {
+        const sourceFileInfo = this.getSourceFileInfo(fileUri);
+        return sourceFileInfo?.chainedSourceFile?.sourceFile.getUri();
     }
 
-    updateChainedFilePath(filePath: string, chainedFilePath: string | undefined) {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        if (sourceFileInfo) {
-            sourceFileInfo.chainedSourceFile = chainedFilePath ? this.getSourceFileInfo(chainedFilePath) : undefined;
-
-            sourceFileInfo.sourceFile.markDirty();
-            this._markFileDirtyRecursive(sourceFileInfo, new Set<string>());
+    updateChainedUri(fileUri: Uri, chainedFileUri: Uri | undefined) {
+        const sourceFileInfo = this.getSourceFileInfo(fileUri);
+        if (!sourceFileInfo) {
+            return;
         }
+
+        sourceFileInfo.chainedSourceFile = chainedFileUri ? this.getSourceFileInfo(chainedFileUri) : undefined;
+        sourceFileInfo.sourceFile.markDirty();
+        this._markFileDirtyRecursive(sourceFileInfo, new Set<string>());
+
+        verifyNoCyclesInChainedFiles(this, sourceFileInfo);
     }
 
-    setFileClosed(filePath: string, isTracked?: boolean): FileDiagnostics[] {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
+    setFileClosed(fileUri: Uri, isTracked?: boolean): FileDiagnostics[] {
+        const sourceFileInfo = this.getSourceFileInfo(fileUri);
         if (sourceFileInfo) {
             sourceFileInfo.isOpenByClient = false;
             sourceFileInfo.isTracked = isTracked ?? sourceFileInfo.isTracked;
-            sourceFileInfo.sourceFile.setClientVersion(null, []);
+            sourceFileInfo.sourceFile.setClientVersion(null, '');
 
             // There is no guarantee that content is saved before the file is closed.
             // We need to mark the file dirty so we can re-analyze next time.
@@ -394,14 +445,14 @@ export class Program {
         return this._removeUnneededFiles();
     }
 
-    markAllFilesDirty(evenIfContentsAreSame: boolean, indexingNeeded = true) {
+    markAllFilesDirty(evenIfContentsAreSame: boolean) {
         const markDirtySet = new Set<string>();
 
         this._sourceFileList.forEach((sourceFileInfo) => {
             if (evenIfContentsAreSame) {
-                sourceFileInfo.sourceFile.markDirty(indexingNeeded);
+                sourceFileInfo.sourceFile.markDirty();
             } else if (sourceFileInfo.sourceFile.didContentsChangeOnDisk()) {
-                sourceFileInfo.sourceFile.markDirty(indexingNeeded);
+                sourceFileInfo.sourceFile.markDirty();
 
                 // Mark any files that depend on this file as dirty
                 // also. This will retrigger analysis of these other files.
@@ -414,17 +465,17 @@ export class Program {
         }
     }
 
-    markFilesDirty(filePaths: string[], evenIfContentsAreSame: boolean, indexingNeeded = true) {
+    markFilesDirty(fileUris: Uri[], evenIfContentsAreSame: boolean) {
         const markDirtySet = new Set<string>();
-        filePaths.forEach((filePath) => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
+        fileUris.forEach((fileUri) => {
+            const sourceFileInfo = this.getSourceFileInfo(fileUri);
             if (sourceFileInfo) {
-                const fileName = getFileName(filePath);
+                const fileName = fileUri.fileName;
 
                 // Handle builtins and __builtins__ specially. They are implicitly
                 // included by all source files.
                 if (fileName === 'builtins.pyi' || fileName === '__builtins__.pyi') {
-                    this.markAllFilesDirty(evenIfContentsAreSame, indexingNeeded);
+                    this.markAllFilesDirty(evenIfContentsAreSame);
                     return;
                 }
 
@@ -435,7 +486,7 @@ export class Program {
                     evenIfContentsAreSame ||
                     (!sourceFileInfo.isOpenByClient && sourceFileInfo.sourceFile.didContentsChangeOnDisk())
                 ) {
-                    sourceFileInfo.sourceFile.markDirty(indexingNeeded);
+                    sourceFileInfo.sourceFile.markDirty();
 
                     // Mark any files that depend on this file as dirty
                     // also. This will retrigger analysis of these other files.
@@ -449,7 +500,11 @@ export class Program {
         }
     }
 
-    getFileCount() {
+    getFileCount(userFileOnly = true) {
+        if (userFileOnly) {
+            return this._sourceFileList.filter((f) => isUserCode(f)).length;
+        }
+
         return this._sourceFileList.length;
     }
 
@@ -459,43 +514,70 @@ export class Program {
         return this._sourceFileList.filter((s) => isUserCode(s)).length;
     }
 
-    getTracked(): SourceFileInfo[] {
-        return this._sourceFileList.filter((s) => s.isTracked);
+    getUserFiles(): SourceFileInfo[] {
+        return this._sourceFileList.filter((s) => isUserCode(s));
     }
 
     getOpened(): SourceFileInfo[] {
         return this._sourceFileList.filter((s) => s.isOpenByClient);
     }
 
-    getFilesToAnalyzeCount() {
-        let sourceFileCount = 0;
+    getFilesToAnalyzeCount(): RequiringAnalysisCount {
+        let filesToAnalyzeCount = 0;
+        let cellsToAnalyzeCount = 0;
 
         if (this._disableChecker) {
-            return sourceFileCount;
+            return { files: 0, cells: 0 };
         }
 
         this._sourceFileList.forEach((fileInfo) => {
-            if (fileInfo.sourceFile.isCheckingRequired()) {
+            const sourceFile = fileInfo.sourceFile;
+            if (sourceFile.isCheckingRequired()) {
                 if (this._shouldCheckFile(fileInfo)) {
-                    sourceFileCount++;
+                    sourceFile.getIPythonMode() === IPythonMode.CellDocs
+                        ? cellsToAnalyzeCount++
+                        : filesToAnalyzeCount++;
                 }
             }
         });
 
-        return sourceFileCount;
+        return {
+            files: filesToAnalyzeCount,
+            cells: cellsToAnalyzeCount,
+        };
     }
 
     isCheckingOnlyOpenFiles() {
         return this._configOptions.checkOnlyOpenFiles || false;
     }
 
-    containsSourceFileIn(folder: string): boolean {
-        const normalized = normalizePathCase(this._fs, folder);
-        return this._sourceFileList.some((i) => i.sourceFile.getFilePath().startsWith(normalized));
+    functionSignatureDisplay() {
+        return this._configOptions.functionSignatureDisplay;
     }
 
-    getSourceFile(filePath: string): SourceFile | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
+    containsSourceFileIn(folder: Uri): boolean {
+        for (const normalizedSourceFilePath of this._sourceFileMap.values()) {
+            if (normalizedSourceFilePath.sourceFile.getUri().startsWith(folder)) {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    owns(uri: Uri) {
+        const fileInfo = this.getSourceFileInfo(uri);
+        if (fileInfo) {
+            // If we already determined whether the file is tracked or not, don't do it again.
+            // This will make sure we have consistent look at the state once it is loaded to the memory.
+            return fileInfo.isTracked;
+        }
+
+        return matchFileSpecs(this._configOptions, uri);
+    }
+
+    getSourceFile(uri: Uri): SourceFile | undefined {
+        const sourceFileInfo = this.getSourceFileInfo(uri);
         if (!sourceFileInfo) {
             return undefined;
         }
@@ -503,21 +585,28 @@ export class Program {
         return sourceFileInfo.sourceFile;
     }
 
-    getBoundSourceFile(filePath: string): SourceFile | undefined {
-        return this.getBoundSourceFileInfo(filePath)?.sourceFile;
+    getBoundSourceFile(uri: Uri): SourceFile | undefined {
+        return this.getBoundSourceFileInfo(uri)?.sourceFile;
     }
 
-    getSourceFileInfo(filePath: string): SourceFileInfo | undefined {
-        return this._sourceFileMap.get(normalizePathCase(this._fs, filePath));
+    getSourceFileInfoList(): readonly SourceFileInfo[] {
+        return this._sourceFileList;
     }
 
-    getBoundSourceFileInfo(filePath: string): SourceFileInfo | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
+    getSourceFileInfo(uri: Uri): SourceFileInfo | undefined {
+        if (!uri.isEmpty()) {
+            return this._sourceFileMap.get(uri.key);
+        }
+        return undefined;
+    }
+
+    getBoundSourceFileInfo(uri: Uri, content?: string, force?: boolean): SourceFileInfo | undefined {
+        const sourceFileInfo = this.getSourceFileInfo(uri);
         if (!sourceFileInfo) {
             return undefined;
         }
 
-        this._bindFile(sourceFileInfo);
+        this._bindFile(sourceFileInfo, content, force);
         return sourceFileInfo;
     }
 
@@ -576,63 +665,61 @@ export class Program {
         });
     }
 
-    indexWorkspace(callback: (path: string, results: IndexResults) => void, token: CancellationToken): number {
-        if (!this._configOptions.indexing) {
-            return 0;
-        }
-
+    // Performs parsing and analysis of a single file in the program. If the file is not part of
+    // the program returns false to indicate analysis was not performed.
+    analyzeFile(fileUri: Uri, token: CancellationToken = CancellationToken.None): boolean {
         return this._runEvaluatorWithCancellationToken(token, () => {
-            // Go through all workspace files to create indexing data.
-            // This will cause all files in the workspace to be parsed and bound. But
-            // _handleMemoryHighUsage will make sure we don't OOM and
-            // at the end of this method, we will drop all trees and symbol tables
-            // created due to indexing.
-            const initiallyParsedSet = new Set<SourceFileInfo>();
-            for (const sourceFileInfo of this._sourceFileList) {
-                if (!sourceFileInfo.sourceFile.isParseRequired()) {
-                    initiallyParsedSet.add(sourceFileInfo);
-                }
+            const sourceFileInfo = this.getSourceFileInfo(fileUri);
+            if (sourceFileInfo && this._checkTypes(sourceFileInfo, token)) {
+                return true;
             }
-
-            let count = 0;
-            for (const sourceFileInfo of this._sourceFileList) {
-                if (!isUserCode(sourceFileInfo) || !sourceFileInfo.sourceFile.isIndexingRequired()) {
-                    continue;
-                }
-
-                this._bindFile(sourceFileInfo);
-                const results = sourceFileInfo.sourceFile.index({ indexingForAutoImportMode: false }, token);
-                if (results) {
-                    if (++count > MaxWorkspaceIndexFileCount) {
-                        this._console.warn(`Workspace indexing has hit its upper limit: 2000 files`);
-
-                        dropParseAndBindInfoCreatedForIndexing(this._sourceFileList, initiallyParsedSet);
-                        return count;
-                    }
-
-                    callback(sourceFileInfo.sourceFile.getFilePath(), results);
-                }
-
-                this._handleMemoryHighUsage();
-            }
-
-            dropParseAndBindInfoCreatedForIndexing(this._sourceFileList, initiallyParsedSet);
-            return count;
+            return false;
         });
+    }
 
-        function dropParseAndBindInfoCreatedForIndexing(
-            sourceFiles: SourceFileInfo[],
-            initiallyParsedSet: Set<SourceFileInfo>
-        ) {
-            for (const sourceFileInfo of sourceFiles) {
-                if (sourceFileInfo.sourceFile.isParseRequired() || initiallyParsedSet.has(sourceFileInfo)) {
-                    continue;
-                }
+    // This will allow the callback to execute a type evaluator with an associated
+    // cancellation token and provide a read-only program.
+    run<T>(callback: (p: ProgramView) => T, token: CancellationToken): T {
+        return this._runEvaluatorWithCancellationToken(token, () => callback(this));
+    }
 
-                // Drop parse and bind info created during indexing.
-                sourceFileInfo.sourceFile.dropParseAndBindInfo();
-            }
+    // This will allow the callback to execute a type evaluator with an associated
+    // cancellation token and provide a mutable program. Should already be in edit mode when called.
+    runEditMode(callback: (v: EditableProgram) => void, token: CancellationToken): void {
+        if (this._editModeTracker.isEditMode) {
+            return this._runEvaluatorWithCancellationToken(token, () => callback(this));
         }
+    }
+
+    getSourceMapper(
+        fileUri: Uri,
+        token: CancellationToken,
+        mapCompiled?: boolean,
+        preferStubs?: boolean
+    ): SourceMapper {
+        const sourceFileInfo = this.getSourceFileInfo(fileUri);
+        const execEnv = this._configOptions.findExecEnvironment(fileUri);
+        return this._createSourceMapper(execEnv, token, sourceFileInfo, mapCompiled, preferStubs);
+    }
+
+    getParserOutput(fileUri: Uri): ParserOutput | undefined {
+        return this.getBoundSourceFileInfo(
+            fileUri,
+            /* content */ undefined,
+            /* force */ true
+        )?.sourceFile.getParserOutput();
+    }
+
+    getParseResults(fileUri: Uri): ParseFileResults | undefined {
+        return this.getBoundSourceFileInfo(
+            fileUri,
+            /* content */ undefined,
+            /* force */ true
+        )?.sourceFile.getParseResults();
+    }
+
+    handleMemoryHighUsage() {
+        this._handleMemoryHighUsage();
     }
 
     // Prints a detailed list of files that have been checked and the times associated
@@ -649,41 +736,39 @@ export class Program {
 
         sortedFiles.forEach((sfInfo) => {
             const checkTimeInMs = sfInfo.sourceFile.getCheckTime()!;
-            this._console.info(`${checkTimeInMs}ms: ${sfInfo.sourceFile.getFilePath()}`);
+            this._console.info(`${checkTimeInMs}ms: ${sfInfo.sourceFile.getUri()}`);
         });
     }
 
     // Prints import dependency information for each of the files in
     // the program, skipping any typeshed files.
-    printDependencies(projectRootDir: string, verbose: boolean) {
+    printDependencies(projectRootDir: Uri, verbose: boolean) {
         const fs = this._importResolver.fileSystem;
         const sortedFiles = this._sourceFileList
             .filter((s) => !s.isTypeshedFile)
             .sort((a, b) => {
-                return fs.getOriginalFilePath(a.sourceFile.getFilePath()) <
-                    fs.getOriginalFilePath(b.sourceFile.getFilePath())
-                    ? 1
-                    : -1;
+                return fs.getOriginalUri(a.sourceFile.getUri()) < fs.getOriginalUri(b.sourceFile.getUri()) ? 1 : -1;
             });
 
         const zeroImportFiles: SourceFile[] = [];
 
         sortedFiles.forEach((sfInfo) => {
             this._console.info('');
-            let filePath = fs.getOriginalFilePath(sfInfo.sourceFile.getFilePath());
-            const relPath = getRelativePath(filePath, projectRootDir);
+            const fileUri = fs.getOriginalUri(sfInfo.sourceFile.getUri());
+            let fileString = fileUri.toString();
+            const relPath = projectRootDir.getRelativePathComponents(fileUri);
             if (relPath) {
-                filePath = relPath;
+                fileString = relPath.join('/');
             }
 
-            this._console.info(`${filePath}`);
+            this._console.info(`${fileString}`);
 
             this._console.info(
                 ` Imports     ${sfInfo.imports.length} ` + `file${sfInfo.imports.length === 1 ? '' : 's'}`
             );
             if (verbose) {
                 sfInfo.imports.forEach((importInfo) => {
-                    this._console.info(`    ${fs.getOriginalFilePath(importInfo.sourceFile.getFilePath())}`);
+                    this._console.info(`    ${fs.getOriginalUri(importInfo.sourceFile.getUri())}`);
                 });
             }
 
@@ -692,7 +777,7 @@ export class Program {
             );
             if (verbose) {
                 sfInfo.importedBy.forEach((importInfo) => {
-                    this._console.info(`    ${fs.getOriginalFilePath(importInfo.sourceFile.getFilePath())}`);
+                    this._console.info(`    ${fs.getOriginalUri(importInfo.sourceFile.getUri())}`);
                 });
             }
 
@@ -707,36 +792,36 @@ export class Program {
                 `${zeroImportFiles.length} file${zeroImportFiles.length === 1 ? '' : 's'}` + ` not explicitly imported`
             );
             zeroImportFiles.forEach((importFile) => {
-                this._console.info(`    ${fs.getOriginalFilePath(importFile.getFilePath())}`);
+                this._console.info(`    ${fs.getOriginalUri(importFile.getUri())}`);
             });
         }
     }
 
-    writeTypeStub(targetImportPath: string, targetIsSingleFile: boolean, stubPath: string, token: CancellationToken) {
+    writeTypeStub(targetImportPath: Uri, targetIsSingleFile: boolean, stubPath: Uri, token: CancellationToken) {
         for (const sourceFileInfo of this._sourceFileList) {
             throwIfCancellationRequested(token);
 
-            const filePath = sourceFileInfo.sourceFile.getFilePath();
+            const fileUri = sourceFileInfo.sourceFile.getUri();
 
             // Generate type stubs only for the files within the target path,
             // not any files that the target module happened to import.
-            const relativePath = getRelativePath(filePath, targetImportPath);
+            const relativePath = targetImportPath.getRelativePath(fileUri);
             if (relativePath !== undefined) {
-                let typeStubPath = normalizePath(combinePaths(stubPath, relativePath));
+                let typeStubPath = stubPath.resolvePaths(relativePath);
 
                 // If the target is a single file implementation, as opposed to
                 // a package in a directory, transform the name of the type stub
                 // to __init__.pyi because we're placing it in a directory.
                 if (targetIsSingleFile) {
-                    typeStubPath = combinePaths(getDirectoryPath(typeStubPath), '__init__.pyi');
+                    typeStubPath = typeStubPath.getDirectory().initPyiUri;
                 } else {
-                    typeStubPath = stripFileExtension(typeStubPath) + '.pyi';
+                    typeStubPath = typeStubPath.replaceExtension('.pyi');
                 }
 
-                const typeStubDir = getDirectoryPath(typeStubPath);
+                const typeStubDir = typeStubPath.getDirectory();
 
                 try {
-                    makeDirectories(this._fs, typeStubDir, stubPath);
+                    makeDirectories(this.fileSystem, typeStubDir, stubPath);
                 } catch (e: any) {
                     const errMsg = `Could not create directory for '${typeStubDir}'`;
                     throw new Error(errMsg);
@@ -770,510 +855,8 @@ export class Program {
         return evaluator.printType(type, options);
     }
 
-    private static _getPrintTypeFlags(configOptions: ConfigOptions): PrintTypeFlags {
-        let flags = PrintTypeFlags.None;
-
-        if (configOptions.diagnosticRuleSet.printUnknownAsAny) {
-            flags |= PrintTypeFlags.PrintUnknownWithAny;
-        }
-
-        if (configOptions.diagnosticRuleSet.omitConditionalConstraint) {
-            flags |= PrintTypeFlags.OmitConditionalConstraint;
-        }
-
-        if (configOptions.diagnosticRuleSet.omitTypeArgsIfAny) {
-            flags |= PrintTypeFlags.OmitTypeArgumentsIfAny;
-        }
-
-        if (configOptions.diagnosticRuleSet.omitUnannotatedParamType) {
-            flags |= PrintTypeFlags.OmitUnannotatedParamType;
-        }
-
-        if (configOptions.diagnosticRuleSet.pep604Printing) {
-            flags |= PrintTypeFlags.PEP604;
-        }
-
-        return flags;
-    }
-
-    private get _fs() {
-        return this._importResolver.fileSystem;
-    }
-
-    private _getImportNameForFile(filePath: string) {
-        // We allow illegal module names (e.g. names that include "-" in them)
-        // because we want a unique name for each module even if it cannot be
-        // imported through an "import" statement. It's important to have a
-        // unique name in case two modules declare types with the same local
-        // name. The type checker uses the fully-qualified (unique) module name
-        // to differentiate between such types.
-        const moduleNameAndType = this._importResolver.getModuleNameForImport(
-            filePath,
-            this._configOptions.getDefaultExecEnvironment(),
-            /* allowIllegalModuleName */ true
-        );
-        return moduleNameAndType.moduleName;
-    }
-
-    // A "shadowed" file is a python source file that has been added to the program because
-    // it "shadows" a type stub file for purposes of finding doc strings and definitions.
-    // We need to track the relationship so if the original type stub is removed from the
-    // program, we can remove the corresponding shadowed file and any files it imports.
-    private _addShadowedFile(stubFile: SourceFileInfo, shadowImplPath: string): SourceFile {
-        let shadowFileInfo = this.getSourceFileInfo(shadowImplPath);
-
-        if (!shadowFileInfo) {
-            const importName = this._getImportNameForFile(shadowImplPath);
-            const sourceFile = new SourceFile(
-                this._fs,
-                shadowImplPath,
-                importName,
-                /* isThirdPartyImport */ false,
-                /* isInPyTypedPackage */ false,
-                this._console,
-                this._logTracker
-            );
-            shadowFileInfo = {
-                sourceFile,
-                isTracked: false,
-                isOpenByClient: false,
-                isTypeshedFile: false,
-                isThirdPartyImport: false,
-                isThirdPartyPyTypedPresent: false,
-                diagnosticsVersion: undefined,
-                imports: [],
-                importedBy: [],
-                shadows: [],
-                shadowedBy: [],
-            };
-            this._addToSourceFileListAndMap(shadowFileInfo);
-        }
-
-        if (!shadowFileInfo.shadows.includes(stubFile)) {
-            shadowFileInfo.shadows.push(stubFile);
-        }
-
-        if (!stubFile.shadowedBy.includes(shadowFileInfo)) {
-            stubFile.shadowedBy.push(shadowFileInfo);
-        }
-
-        return shadowFileInfo.sourceFile;
-    }
-
-    private _createNewEvaluator() {
-        if (this._evaluator) {
-            // We shouldn't need to call this, but there appears to be a bug
-            // in the v8 garbage collector where it's unable to resolve orphaned
-            // objects without us giving it some assistance.
-            this._evaluator.disposeEvaluator();
-        }
-
-        this._evaluator = createTypeEvaluatorWithTracker(
-            this._lookUpImport,
-            {
-                printTypeFlags: Program._getPrintTypeFlags(this._configOptions),
-                logCalls: this._configOptions.logTypeEvaluationTime,
-                minimumLoggingThreshold: this._configOptions.typeEvaluationTimeThreshold,
-                analyzeUnannotatedFunctions: this._configOptions.analyzeUnannotatedFunctions,
-                evaluateUnknownImportsAsAny: !!this._configOptions.evaluateUnknownImportsAsAny,
-                verifyTypeCacheEvaluatorFlags: !!this._configOptions.internalTestMode,
-            },
-            this._logTracker,
-            this._configOptions.logTypeEvaluationTime
-                ? createTracePrinter(
-                      this._importResolver.getImportRoots(
-                          this._configOptions.findExecEnvironment(this._configOptions.projectRoot)
-                      )
-                  )
-                : undefined
-        );
-
-        return this._evaluator;
-    }
-
-    private _parseFile(fileToParse: SourceFileInfo, content?: string) {
-        if (!this._isFileNeeded(fileToParse) || !fileToParse.sourceFile.isParseRequired()) {
-            return;
-        }
-
-        if (fileToParse.sourceFile.parse(this._configOptions, this._importResolver, content)) {
-            this._parsedFileCount++;
-            this._updateSourceFileImports(fileToParse, this._configOptions);
-        }
-
-        if (fileToParse.sourceFile.isFileDeleted()) {
-            fileToParse.isTracked = false;
-
-            // Mark any files that depend on this file as dirty
-            // also. This will retrigger analysis of these other files.
-            const markDirtySet = new Set<string>();
-            this._markFileDirtyRecursive(fileToParse, markDirtySet);
-
-            // Invalidate the import resolver's cache as well.
-            this._importResolver.invalidateCache();
-        }
-    }
-
-    // Binds the specified file and all of its dependencies, recursively. If
-    // it runs out of time, it returns true. If it completes, it returns false.
-    private _bindFile(fileToAnalyze: SourceFileInfo, content?: string): void {
-        if (!this._isFileNeeded(fileToAnalyze) || !fileToAnalyze.sourceFile.isBindingRequired()) {
-            return;
-        }
-
-        this._parseFile(fileToAnalyze, content);
-
-        const getScopeIfAvailable = (fileInfo: SourceFileInfo | undefined) => {
-            if (!fileInfo || fileInfo === fileToAnalyze) {
-                return undefined;
-            }
-
-            this._bindFile(fileInfo);
-            if (fileInfo.sourceFile.isFileDeleted()) {
-                return undefined;
-            }
-
-            const parseResults = fileInfo.sourceFile.getParseResults();
-            if (!parseResults) {
-                return undefined;
-            }
-
-            const scope = AnalyzerNodeInfo.getScope(parseResults.parseTree);
-            assert(scope !== undefined);
-
-            return scope;
-        };
-
-        let builtinsScope: Scope | undefined;
-        if (fileToAnalyze.builtinsImport && fileToAnalyze.builtinsImport !== fileToAnalyze) {
-            // If it is not builtin module itself, we need to parse and bind
-            // the ipython display import if required. Otherwise, get builtin module.
-            builtinsScope =
-                getScopeIfAvailable(fileToAnalyze.chainedSourceFile) ??
-                getScopeIfAvailable(fileToAnalyze.ipythonDisplayImport) ??
-                getScopeIfAvailable(fileToAnalyze.builtinsImport);
-        }
-
-        let futureImports = fileToAnalyze.sourceFile.getParseResults()!.futureImports;
-        if (fileToAnalyze.chainedSourceFile) {
-            futureImports = this._getEffectiveFutureImports(futureImports, fileToAnalyze.chainedSourceFile);
-        }
-        fileToAnalyze.effectiveFutureImports = futureImports.size > 0 ? futureImports : undefined;
-
-        fileToAnalyze.sourceFile.bind(this._configOptions, this._lookUpImport, builtinsScope, futureImports);
-    }
-
-    private _getEffectiveFutureImports(futureImports: Set<string>, chainedSourceFile: SourceFileInfo): Set<string> {
-        const effectiveFutureImports = new Set<string>(futureImports);
-
-        chainedSourceFile.effectiveFutureImports?.forEach((value) => {
-            effectiveFutureImports.add(value);
-        });
-
-        return effectiveFutureImports;
-    }
-
-    private _lookUpImport = (filePathOrModule: string | AbsoluteModuleDescriptor): ImportLookupResult | undefined => {
-        let sourceFileInfo: SourceFileInfo | undefined;
-
-        if (typeof filePathOrModule === 'string') {
-            sourceFileInfo = this.getSourceFileInfo(filePathOrModule);
-        } else {
-            // Resolve the import.
-            const importResult = this._importResolver.resolveImport(
-                filePathOrModule.importingFilePath,
-                this._configOptions.findExecEnvironment(filePathOrModule.importingFilePath),
-                {
-                    leadingDots: 0,
-                    nameParts: filePathOrModule.nameParts,
-                    importedSymbols: undefined,
-                }
-            );
-
-            if (importResult.isImportFound && !importResult.isNativeLib && importResult.resolvedPaths.length > 0) {
-                let resolvedPath = importResult.resolvedPaths[importResult.resolvedPaths.length - 1];
-                if (resolvedPath) {
-                    // See if the source file already exists in the program.
-                    sourceFileInfo = this.getSourceFileInfo(resolvedPath);
-
-                    if (!sourceFileInfo) {
-                        resolvedPath = normalizePathCase(this._fs, resolvedPath);
-
-                        // Start tracking the source file.
-                        this.addTrackedFile(resolvedPath);
-                        sourceFileInfo = this.getSourceFileInfo(resolvedPath);
-                    }
-                }
-            }
-        }
-
-        if (!sourceFileInfo) {
-            return undefined;
-        }
-
-        if (sourceFileInfo.sourceFile.isBindingRequired()) {
-            // Bind the file if it's not already bound. Don't count this time
-            // against the type checker.
-            timingStats.typeCheckerTime.subtractFromTime(() => {
-                this._bindFile(sourceFileInfo!);
-            });
-        }
-
-        const symbolTable = sourceFileInfo.sourceFile.getModuleSymbolTable();
-        if (!symbolTable) {
-            return undefined;
-        }
-
-        const parseResults = sourceFileInfo.sourceFile.getParseResults();
-        const moduleNode = parseResults!.parseTree;
-
-        const dunderAllInfo = AnalyzerNodeInfo.getDunderAllInfo(parseResults!.parseTree);
-
-        return {
-            symbolTable,
-            dunderAllNames: dunderAllInfo?.names,
-            usesUnsupportedDunderAllForm: dunderAllInfo?.usesUnsupportedDunderAllForm ?? false,
-            get docString() {
-                return getDocString(moduleNode.statements);
-            },
-        };
-    };
-
-    // Build a map of all modules within this program and the module-
-    // level scope that contains the symbol table for the module.
-    private _buildModuleSymbolsMap(
-        sourceFileToExclude: SourceFileInfo,
-        userFileOnly: boolean,
-        includeIndexUserSymbols: boolean,
-        token: CancellationToken
-    ): ModuleSymbolMap {
-        // If we have library map, always use the map for library symbols.
-        return buildModuleSymbolsMap(
-            this._sourceFileList.filter((s) => s !== sourceFileToExclude && (userFileOnly ? isUserCode(s) : true)),
-            includeIndexUserSymbols,
-            token
-        );
-    }
-
-    private _shouldCheckFile(fileInfo: SourceFileInfo) {
-        // Always do a full checking for a file that's open in the editor.
-        if (fileInfo.isOpenByClient) {
-            return true;
-        }
-
-        // If the file isn't currently open, only perform full checking for
-        // files that are tracked, and only if the checkOnlyOpenFiles is disabled.
-        if (!this._configOptions.checkOnlyOpenFiles && fileInfo.isTracked) {
-            return true;
-        }
-
-        return false;
-    }
-
-    private _checkTypes(fileToCheck: SourceFileInfo, token: CancellationToken) {
-        return this._logTracker.log(`analyzing: ${fileToCheck.sourceFile.getFilePath()}`, (logState) => {
-            // If the file isn't needed because it was eliminated from the
-            // transitive closure or deleted, skip the file rather than wasting
-            // time on it.
-            if (!this._isFileNeeded(fileToCheck)) {
-                logState.suppress();
-                return false;
-            }
-
-            if (!fileToCheck.sourceFile.isCheckingRequired()) {
-                logState.suppress();
-                return false;
-            }
-
-            if (!this._shouldCheckFile(fileToCheck)) {
-                logState.suppress();
-                return false;
-            }
-
-            this._bindFile(fileToCheck);
-
-            if (this._preCheckCallback) {
-                const parseResults = fileToCheck.sourceFile.getParseResults();
-                if (parseResults) {
-                    this._preCheckCallback(parseResults, this._evaluator!);
-                }
-            }
-
-            if (!this._disableChecker) {
-                const execEnv = this._configOptions.findExecEnvironment(fileToCheck.sourceFile.getFilePath());
-                fileToCheck.sourceFile.check(
-                    this._importResolver,
-                    this._evaluator!,
-                    execEnv,
-                    this._createSourceMapper(execEnv, token, fileToCheck),
-                    (p) => isUserCode(this.getSourceFileInfo(p))
-                );
-            }
-
-            // For very large programs, we may need to discard the evaluator and
-            // its cached types to avoid running out of heap space.
-            this._handleMemoryHighUsage();
-
-            // Detect import cycles that involve the file.
-            if (this._configOptions.diagnosticRuleSet.reportImportCycles !== 'none') {
-                // Don't detect import cycles when doing type stub generation. Some
-                // third-party modules are pretty convoluted.
-                if (!this._allowedThirdPartyImports) {
-                    // We need to force all of the files to be parsed and build
-                    // a closure map for the files.
-                    const closureMap = new Map<string, SourceFileInfo>();
-                    this._getImportsRecursive(fileToCheck, closureMap, 0);
-
-                    closureMap.forEach((file) => {
-                        timingStats.cycleDetectionTime.timeOperation(() => {
-                            const filesVisitedMap = new Map<string, SourceFileInfo>();
-
-                            if (!this._detectAndReportImportCycles(file, filesVisitedMap)) {
-                                // If no cycles were reported, set a flag in all of the visited files
-                                // so we don't need to visit them again on subsequent cycle checks.
-                                filesVisitedMap.forEach((sourceFileInfo) => {
-                                    sourceFileInfo.sourceFile.setNoCircularDependencyConfirmed();
-                                });
-                            }
-                        });
-                    });
-                }
-            }
-
-            return true;
-        });
-    }
-
-    // Builds a map of files that includes the specified file and all of the files
-    // it imports (recursively) and ensures that all such files. If any of these files
-    // have already been checked (they and their recursive imports have completed the
-    // check phase), they are not included in the results.
-    private _getImportsRecursive(
-        file: SourceFileInfo,
-        closureMap: Map<string, SourceFileInfo>,
-        recursionCount: number
-    ) {
-        // If the file is already in the closure map, we found a cyclical
-        // dependency. Don't recur further.
-        const filePath = normalizePathCase(this._fs, file.sourceFile.getFilePath());
-        if (closureMap.has(filePath)) {
-            return;
-        }
-
-        // If the import chain is too long, emit an error. Otherwise we
-        // risk blowing the stack.
-        if (recursionCount > _maxImportDepth) {
-            file.sourceFile.setHitMaxImportDepth(_maxImportDepth);
-            return;
-        }
-
-        // Add the file to the closure map.
-        closureMap.set(filePath, file);
-
-        // If this file hasn't already been parsed, parse it now. This will
-        // discover any files it imports. Skip this if the file is part
-        // of a library. We'll assume that no cycles will be generated from
-        // library code or typeshed stubs.
-        if (isUserCode(file)) {
-            this._parseFile(file);
-        }
-
-        // Recursively add the file's imports.
-        for (const importedFileInfo of file.imports) {
-            this._getImportsRecursive(importedFileInfo, closureMap, recursionCount + 1);
-        }
-    }
-
-    private _detectAndReportImportCycles(
-        sourceFileInfo: SourceFileInfo,
-        filesVisited: Map<string, SourceFileInfo>,
-        dependencyChain: SourceFileInfo[] = [],
-        dependencyMap = new Map<string, boolean>()
-    ): boolean {
-        // Don't bother checking for typestub files or third-party files.
-        if (sourceFileInfo.sourceFile.isStubFile() || sourceFileInfo.isThirdPartyImport) {
-            return false;
-        }
-
-        // If we've already confirmed that this source file isn't part of a
-        // cycle, we can skip it entirely.
-        if (sourceFileInfo.sourceFile.isNoCircularDependencyConfirmed()) {
-            return false;
-        }
-
-        filesVisited.set(sourceFileInfo.sourceFile.getFilePath(), sourceFileInfo);
-        let detectedCycle = false;
-
-        const filePath = normalizePathCase(this._fs, sourceFileInfo.sourceFile.getFilePath());
-        if (dependencyMap.has(filePath)) {
-            // Look for chains at least two in length. A file that contains
-            // an "import . from X" will technically create a cycle with
-            // itself, but those are not interesting to report.
-            if (dependencyChain.length > 1 && sourceFileInfo === dependencyChain[0]) {
-                this._logImportCycle(dependencyChain);
-                detectedCycle = true;
-            }
-        } else {
-            // If we've already checked this dependency along
-            // some other path, we can skip it.
-            if (dependencyMap.has(filePath)) {
-                return false;
-            }
-
-            // We use both a map (for fast lookups) and a list
-            // (for ordering information). Set the dependency map
-            // entry to true to indicate that we're actively exploring
-            // that dependency.
-            dependencyMap.set(filePath, true);
-            dependencyChain.push(sourceFileInfo);
-
-            for (const imp of sourceFileInfo.imports) {
-                if (this._detectAndReportImportCycles(imp, filesVisited, dependencyChain, dependencyMap)) {
-                    detectedCycle = true;
-                }
-            }
-
-            // Set the dependencyMap entry to false to indicate that we have
-            // already explored this file and don't need to explore it again.
-            dependencyMap.set(filePath, false);
-            dependencyChain.pop();
-        }
-
-        return detectedCycle;
-    }
-
-    private _logImportCycle(dependencyChain: SourceFileInfo[]) {
-        const circDep = new CircularDependency();
-        dependencyChain.forEach((sourceFileInfo) => {
-            circDep.appendPath(sourceFileInfo.sourceFile.getFilePath());
-        });
-
-        circDep.normalizeOrder();
-        const firstFilePath = circDep.getPaths()[0];
-        const firstSourceFile = this.getSourceFileInfo(firstFilePath)!;
-        assert(firstSourceFile !== undefined);
-        firstSourceFile.sourceFile.addCircularDependency(circDep);
-    }
-
-    private _markFileDirtyRecursive(sourceFileInfo: SourceFileInfo, markSet: Set<string>, forceRebinding = false) {
-        const filePath = normalizePathCase(this._fs, sourceFileInfo.sourceFile.getFilePath());
-
-        // Don't mark it again if it's already been visited.
-        if (!markSet.has(filePath)) {
-            sourceFileInfo.sourceFile.markReanalysisRequired(forceRebinding);
-            markSet.add(filePath);
-
-            sourceFileInfo.importedBy.forEach((dep) => {
-                // Changes on chained source file can change symbols in the symbol table and
-                // dependencies on the dependent file. Force rebinding.
-                const forceRebinding = dep.chainedSourceFile === sourceFileInfo;
-                this._markFileDirtyRecursive(dep, markSet, forceRebinding);
-            });
-        }
-    }
-
-    getTextOnRange(filePath: string, range: Range, token: CancellationToken): string | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
+    getTextOnRange(fileUri: Uri, range: Range, token: CancellationToken): string | undefined {
+        const sourceFileInfo = this.getSourceFileInfo(fileUri);
         if (!sourceFileInfo) {
             return undefined;
         }
@@ -1288,8 +871,8 @@ export class Program {
         return this._runEvaluatorWithCancellationToken(token, () => {
             this._parseFile(sourceFileInfo);
 
-            const parseTree = sourceFile.getParseResults()!;
-            const textRange = convertRangeToTextRange(range, parseTree.tokenizerOutput.lines);
+            const parseResults = sourceFile.getParseResults()!;
+            const textRange = convertRangeToTextRange(range, parseResults.tokenizerOutput.lines);
             if (!textRange) {
                 return undefined;
             }
@@ -1298,95 +881,29 @@ export class Program {
         });
     }
 
-    getAutoImports(
-        filePath: string,
-        range: Range,
-        similarityLimit: number,
-        nameMap: AbbreviationMap | undefined,
-        options: AutoImportOptions,
-        token: CancellationToken
-    ): AutoImportResult[] {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        if (!sourceFileInfo) {
-            return [];
-        }
-
-        const sourceFile = sourceFileInfo.sourceFile;
-        const fileContents = sourceFile.getOpenFileContents();
-        if (fileContents === undefined) {
-            // this only works with opened file
-            return [];
-        }
-
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            this._bindFile(sourceFileInfo);
-
-            const parseTree = sourceFile.getParseResults()!;
-            const textRange = convertRangeToTextRange(range, parseTree.tokenizerOutput.lines);
-            if (!textRange) {
-                return [];
-            }
-
-            const currentNode = findNodeByOffset(parseTree.parseTree, textRange.start);
-            if (!currentNode) {
-                return [];
-            }
-
-            const writtenWord = fileContents.substr(textRange.start, textRange.length);
-            const map = this._buildModuleSymbolsMap(
-                sourceFileInfo,
-                !!options.libraryMap,
-                /* includeIndexUserSymbols */ true,
-                token
-            );
-
-            options.patternMatcher =
-                options.patternMatcher ?? ((p, t) => computeCompletionSimilarity(p, t) > similarityLimit);
-
-            const autoImporter = new AutoImporter(
-                this._configOptions.findExecEnvironment(filePath),
-                this._importResolver,
-                parseTree,
-                range.start,
-                new CompletionMap(),
-                map,
-                options
-            );
-
-            // Filter out any name that is already defined in the current scope.
-            const results: AutoImportResult[] = [];
-
-            const currentScope = getScopeForNode(currentNode);
-            if (currentScope) {
-                const info = nameMap?.get(writtenWord);
-                if (info) {
-                    // No scope filter is needed since we only do exact match.
-                    appendArray(results, autoImporter.getAutoImportCandidatesForAbbr(writtenWord, info, token));
-                }
-
-                results.push(
-                    ...autoImporter
-                        .getAutoImportCandidates(writtenWord, similarityLimit, /* abbrFromUsers */ undefined, token)
-                        .filter((r) => !currentScope.lookUpSymbolRecursive(r.name))
-                );
-            }
-
-            return results;
-        });
-    }
-
-    getDiagnostics(options: ConfigOptions): FileDiagnostics[] {
+    getDiagnostics(options: ConfigOptions, reportDeltasOnly = true): FileDiagnostics[] {
         const fileDiagnostics: FileDiagnostics[] = this._removeUnneededFiles();
 
         this._sourceFileList.forEach((sourceFileInfo) => {
             if (this._shouldCheckFile(sourceFileInfo)) {
-                const diagnostics = sourceFileInfo.sourceFile.getDiagnostics(
+                let diagnostics = sourceFileInfo.sourceFile.getDiagnostics(
                     options,
-                    sourceFileInfo.diagnosticsVersion
+                    reportDeltasOnly ? sourceFileInfo.diagnosticsVersion : undefined
                 );
+
                 if (diagnostics !== undefined) {
+                    // Filter out all categories that are translated to tagged hints?
+                    if (options.disableTaggedHints) {
+                        diagnostics = diagnostics.filter(
+                            (diag) =>
+                                diag.category !== DiagnosticCategory.UnreachableCode &&
+                                diag.category !== DiagnosticCategory.UnusedCode &&
+                                diag.category !== DiagnosticCategory.Deprecated
+                        );
+                    }
+
                     fileDiagnostics.push({
-                        filePath: sourceFileInfo.sourceFile.getFilePath(),
+                        fileUri: sourceFileInfo.sourceFile.getUri(),
                         version: sourceFileInfo.sourceFile.getClientVersion(),
                         diagnostics,
                     });
@@ -1403,7 +920,7 @@ export class Program {
                 // This condition occurs when the user switches from workspace to
                 // "open files only" mode. Clear all diagnostics for this file.
                 fileDiagnostics.push({
-                    filePath: sourceFileInfo.sourceFile.getFilePath(),
+                    fileUri: sourceFileInfo.sourceFile.getUri(),
                     version: sourceFileInfo.sourceFile.getClientVersion(),
                     diagnostics: [],
                 });
@@ -1414,8 +931,8 @@ export class Program {
         return fileDiagnostics;
     }
 
-    getDiagnosticsForRange(filePath: string, range: Range): Diagnostic[] {
-        const sourceFile = this.getSourceFile(filePath);
+    getDiagnosticsForRange(fileUri: Uri, range: Range): Diagnostic[] {
+        const sourceFile = this.getSourceFile(fileUri);
         if (!sourceFile) {
             return [];
         }
@@ -1430,820 +947,40 @@ export class Program {
         });
     }
 
-    getDefinitionsForPosition(
-        filePath: string,
-        position: Position,
-        filter: DefinitionFilter,
-        token: CancellationToken
-    ): DocumentRange[] | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(sourceFileInfo);
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            return sourceFileInfo.sourceFile.getDefinitionsForPosition(
-                this._createSourceMapper(execEnv, token, sourceFileInfo),
-                position,
-                filter,
-                this._evaluator!,
-                token
-            );
-        });
-    }
-
-    getTypeDefinitionsForPosition(
-        filePath: string,
-        position: Position,
-        token: CancellationToken
-    ): DocumentRange[] | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(sourceFileInfo);
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            return sourceFileInfo.sourceFile.getTypeDefinitionsForPosition(
-                this._createSourceMapper(
-                    execEnv,
-                    token,
-                    sourceFileInfo,
-                    /* mapCompiled */ false,
-                    /* preferStubs */ true
-                ),
-                position,
-                this._evaluator!,
-                filePath,
-                token
-            );
-        });
-    }
-
-    reportReferencesForPosition(
-        filePath: string,
-        position: Position,
-        includeDeclaration: boolean,
-        reporter: ReferenceCallback,
-        token: CancellationToken
-    ) {
-        this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return;
-            }
-
-            const invokedFromUserFile = isUserCode(sourceFileInfo);
-            this._bindFile(sourceFileInfo);
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            const referencesResult = sourceFileInfo.sourceFile.getDeclarationForPosition(
-                this._createSourceMapper(execEnv, token, sourceFileInfo),
-                position,
-                this._evaluator!,
-                reporter,
-                token
-            );
-
-            if (!referencesResult) {
-                return;
-            }
-
-            // Do we need to do a global search as well?
-            if (referencesResult.requiresGlobalSearch) {
-                for (const curSourceFileInfo of this._sourceFileList) {
-                    throwIfCancellationRequested(token);
-
-                    // "Find all references" will only include references from user code
-                    // unless the file is explicitly opened in the editor or it is invoked from non user files.
-                    if (curSourceFileInfo.isOpenByClient || !invokedFromUserFile || isUserCode(curSourceFileInfo)) {
-                        // See if the reference symbol's string is located somewhere within the file.
-                        // If not, we can skip additional processing for the file.
-                        const fileContents = curSourceFileInfo.sourceFile.getFileContent();
-                        if (!fileContents || fileContents.search(referencesResult.symbolName) >= 0) {
-                            this._bindFile(curSourceFileInfo);
-
-                            curSourceFileInfo.sourceFile.addReferences(
-                                referencesResult,
-                                includeDeclaration,
-                                this._evaluator!,
-                                token
-                            );
-                        }
-
-                        // This operation can consume significant memory, so check
-                        // for situations where we need to discard the type cache.
-                        this._handleMemoryHighUsage();
-                    }
-                }
-
-                // Make sure to include declarations regardless where they are defined
-                // if includeDeclaration is set.
-                if (includeDeclaration) {
-                    for (const decl of referencesResult.declarations) {
-                        throwIfCancellationRequested(token);
-
-                        if (referencesResult.locations.some((l) => l.path === decl.path)) {
-                            // Already included.
-                            continue;
-                        }
-
-                        const declFileInfo = this.getSourceFileInfo(decl.path);
-                        if (!declFileInfo) {
-                            // The file the declaration belongs to doesn't belong to the program.
-                            continue;
-                        }
-
-                        const tempResult = new ReferencesResult(
-                            referencesResult.requiresGlobalSearch,
-                            referencesResult.nodeAtOffset,
-                            referencesResult.symbolName,
-                            referencesResult.declarations
-                        );
-
-                        declFileInfo.sourceFile.addReferences(tempResult, includeDeclaration, this._evaluator!, token);
-                        for (const loc of tempResult.locations) {
-                            // Include declarations only. And throw away any references
-                            if (loc.path === decl.path && doesRangeContain(decl.range, loc.range)) {
-                                referencesResult.addLocations(loc);
-                            }
-                        }
-                    }
-                }
-            } else {
-                sourceFileInfo.sourceFile.addReferences(referencesResult, includeDeclaration, this._evaluator!, token);
-            }
-        });
-    }
-
-    getFileIndex(filePath: string, options: IndexOptions, token: CancellationToken): IndexResults | undefined {
-        if (options.indexingForAutoImportMode) {
-            // Memory optimization. We only want to hold onto symbols
-            // usable outside when importSymbolsOnly is on.
-            const name = stripFileExtension(getFileName(filePath));
-            if (isPrivateOrProtectedName(name)) {
-                return undefined;
-            }
-        }
-
-        this._handleMemoryHighUsage();
-
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            const content = sourceFileInfo.sourceFile.getFileContent() ?? '';
-            if (
-                options.indexingForAutoImportMode &&
-                !options.forceIndexing &&
-                !sourceFileInfo.sourceFile.isStubFile() &&
-                !sourceFileInfo.sourceFile.isThirdPartyPyTypedPresent()
-            ) {
-                // Perf optimization. if py file doesn't contain __all__
-                // No need to parse and bind.
-                if (content.indexOf('__all__') < 0) {
-                    return undefined;
-                }
-            }
-
-            this._bindFile(sourceFileInfo, content);
-            return sourceFileInfo.sourceFile.index(options, token);
-        });
-    }
-
-    addSymbolsForDocument(filePath: string, symbolList: DocumentSymbol[], token: CancellationToken) {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (sourceFileInfo) {
-                if (!sourceFileInfo.sourceFile.getCachedIndexResults()) {
-                    // If we already have cached index for this file, no need to bind this file.
-                    this._bindFile(sourceFileInfo);
-                }
-
-                sourceFileInfo.sourceFile.addHierarchicalSymbolsForDocument(symbolList, token);
-            }
-        });
-    }
-
-    reportSymbolsForWorkspace(query: string, reporter: WorkspaceSymbolCallback, token: CancellationToken) {
-        this._runEvaluatorWithCancellationToken(token, () => {
-            // Don't do a search if the query is empty. We'll return
-            // too many results in this case.
-            if (!query) {
-                return;
-            }
-
-            // "Workspace symbols" searches symbols only from user code.
-            for (const sourceFileInfo of this._sourceFileList) {
-                if (!isUserCode(sourceFileInfo)) {
-                    continue;
-                }
-
-                if (!sourceFileInfo.sourceFile.getCachedIndexResults()) {
-                    // If we already have cached index for this file, no need to bind this file.
-                    this._bindFile(sourceFileInfo);
-                }
-
-                const symbolList = sourceFileInfo.sourceFile.getSymbolsForDocument(query, token);
-                if (symbolList.length > 0) {
-                    reporter(symbolList);
-                }
-
-                // This operation can consume significant memory, so check
-                // for situations where we need to discard the type cache.
-                this._handleMemoryHighUsage();
-            }
-        });
-    }
-
-    getHoverForPosition(
-        filePath: string,
-        position: Position,
-        format: MarkupKind,
-        token: CancellationToken
-    ): HoverResults | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(sourceFileInfo);
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            return sourceFileInfo.sourceFile.getHoverForPosition(
-                this._createSourceMapper(execEnv, token, sourceFileInfo, /* mapCompiled */ true),
-                position,
-                format,
-                this._evaluator!,
-                token
-            );
-        });
-    }
-
-    getDocumentHighlight(
-        filePath: string,
-        position: Position,
-        token: CancellationToken
-    ): DocumentHighlight[] | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(sourceFileInfo);
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            return sourceFileInfo.sourceFile.getDocumentHighlight(
-                this._createSourceMapper(execEnv, token, sourceFileInfo),
-                position,
-                this._evaluator!,
-                token
-            );
-        });
-    }
-
-    getSignatureHelpForPosition(
-        filePath: string,
-        position: Position,
-        format: MarkupKind,
-        token: CancellationToken
-    ): SignatureHelpResults | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(sourceFileInfo);
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            return sourceFileInfo.sourceFile.getSignatureHelpForPosition(
-                position,
-                this._createSourceMapper(execEnv, token, sourceFileInfo, /* mapCompiled */ true),
-                this._evaluator!,
-                format,
-                token
-            );
-        });
-    }
-
-    async getCompletionsForPosition(
-        filePath: string,
-        position: Position,
-        workspacePath: string,
-        options: CompletionOptions,
-        nameMap: AbbreviationMap | undefined,
-        libraryMap: Map<string, IndexResults> | undefined,
-        token: CancellationToken
-    ): Promise<CompletionResultsList | undefined> {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        if (!sourceFileInfo) {
-            return undefined;
-        }
-
-        const completionResult = this._logTracker.log(
-            `completion at ${filePath}:${position.line}:${position.character}`,
-            (ls) => {
-                const result = this._runEvaluatorWithCancellationToken(token, () => {
-                    this._bindFile(sourceFileInfo);
-
-                    const execEnv = this._configOptions.findExecEnvironment(filePath);
-                    return sourceFileInfo.sourceFile.getCompletionsForPosition(
-                        position,
-                        workspacePath,
-                        this._configOptions,
-                        this._importResolver,
-                        this._lookUpImport,
-                        this._evaluator!,
-                        options,
-                        this._createSourceMapper(execEnv, token, sourceFileInfo, /* mapCompiled */ true),
-                        nameMap,
-                        libraryMap,
-                        () =>
-                            this._buildModuleSymbolsMap(
-                                sourceFileInfo,
-                                !!libraryMap,
-                                options.includeUserSymbolsInAutoImport,
-                                token
-                            ),
-                        token
-                    );
-                });
-
-                ls.add(`found ${result?.completionMap.size ?? 'null'} items`);
-                return result;
-            }
+    clone() {
+        const program = new Program(
+            this._importResolver,
+            this._configOptions,
+            this.serviceProvider,
+            new LogTracker(this._console, 'Cloned'),
+            this._disableChecker
         );
 
-        const completionResultsList: CompletionResultsList = {
-            completionList: CompletionList.create(completionResult?.completionMap.toArray()),
-            memberAccessInfo: completionResult?.memberAccessInfo,
-            autoImportInfo: completionResult?.autoImportInfo,
-            extensionInfo: completionResult?.extensionInfo,
-        };
+        // Cloned program will use whatever user files the program currently has.
+        const userFiles = this.getUserFiles();
+        program.setTrackedFiles(userFiles.map((i) => i.sourceFile.getUri()));
+        program.markAllFilesDirty(/* evenIfContentsAreSame */ true);
 
-        if (!completionResult || !this._extension?.completionListExtension) {
-            return completionResultsList;
-        }
-
-        const parseResults = sourceFileInfo.sourceFile.getParseResults();
-        if (parseResults?.parseTree && parseResults?.text) {
-            const offset = convertPositionToOffset(position, parseResults.tokenizerOutput.lines);
-            if (offset !== undefined) {
-                await this._extension.completionListExtension.updateCompletionResults(
-                    completionResultsList,
-                    parseResults,
-                    offset,
-                    token
-                );
-            }
-        }
-
-        return completionResultsList;
-    }
-
-    resolveCompletionItem(
-        filePath: string,
-        completionItem: CompletionItem,
-        options: CompletionOptions,
-        nameMap: AbbreviationMap | undefined,
-        libraryMap: Map<string, IndexResults> | undefined,
-        token: CancellationToken
-    ) {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return;
+        // Make sure we keep editor content (open file) which could be different than one in the file system.
+        for (const fileInfo of this.getOpened()) {
+            const version = fileInfo.sourceFile.getClientVersion();
+            if (version === undefined) {
+                continue;
             }
 
-            this._bindFile(sourceFileInfo);
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            sourceFileInfo.sourceFile.resolveCompletionItem(
-                this._configOptions,
-                this._importResolver,
-                this._lookUpImport,
-                this._evaluator!,
-                options,
-                this._createSourceMapper(execEnv, token, sourceFileInfo, /* mapCompiled */ true),
-                nameMap,
-                libraryMap,
-                () =>
-                    this._buildModuleSymbolsMap(
-                        sourceFileInfo,
-                        !!libraryMap,
-                        options.includeUserSymbolsInAutoImport,
-                        token
-                    ),
-                completionItem,
-                token
-            );
-        });
-    }
-
-    renameModule(path: string, newPath: string, token: CancellationToken): FileEditActions | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            if (isFile(this._fs, path)) {
-                const fileInfo = this.getSourceFileInfo(path);
-                if (!fileInfo) {
-                    return undefined;
+            program.setFileOpened(
+                fileInfo.sourceFile.getUri(),
+                version,
+                fileInfo.sourceFile.getOpenFileContents() ?? '',
+                {
+                    chainedFileUri: fileInfo.chainedSourceFile?.sourceFile.getUri(),
+                    ipythonMode: fileInfo.sourceFile.getIPythonMode(),
+                    isTracked: fileInfo.isTracked,
                 }
-            }
-
-            const renameModuleProvider = RenameModuleProvider.createForModule(
-                this._importResolver,
-                this._configOptions,
-                this._evaluator!,
-                path,
-                newPath,
-                token
             );
-            if (!renameModuleProvider) {
-                return undefined;
-            }
-
-            this._processModuleReferences(renameModuleProvider, renameModuleProvider.lastModuleName, path);
-            return { edits: renameModuleProvider.getEdits(), fileOperations: [] };
-        });
-    }
-
-    moveSymbolAtPosition(
-        filePath: string,
-        newFilePath: string,
-        position: Position,
-        token: CancellationToken
-    ): FileEditActions | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const fileInfo = this.getSourceFileInfo(filePath);
-            if (!fileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(fileInfo);
-            const parseResults = fileInfo.sourceFile.getParseResults();
-            if (!parseResults) {
-                return undefined;
-            }
-
-            const offset = convertPositionToOffset(position, parseResults.tokenizerOutput.lines);
-            if (offset === undefined) {
-                return undefined;
-            }
-
-            const node = findNodeByOffset(parseResults.parseTree, offset);
-            if (node === undefined) {
-                return undefined;
-            }
-
-            // If this isn't a name node, there are no references to be found.
-            if (node.nodeType !== ParseNodeType.Name) {
-                return undefined;
-            }
-
-            const execEnv = this._configOptions.findExecEnvironment(filePath);
-            const declarations = DocumentSymbolCollector.getDeclarationsForNode(
-                node,
-                this._evaluator!,
-                /* resolveLocalNames */ false,
-                token,
-                this._createSourceMapper(execEnv, token, fileInfo)
-            );
-
-            const renameModuleProvider = RenameModuleProvider.createForSymbol(
-                this._importResolver,
-                this._configOptions,
-                this._evaluator!,
-                filePath,
-                newFilePath,
-                declarations,
-                token
-            );
-            if (!renameModuleProvider) {
-                return undefined;
-            }
-
-            this._processModuleReferences(renameModuleProvider, node.value, filePath);
-            return { edits: renameModuleProvider.getEdits(), fileOperations: [] };
-        });
-    }
-
-    canRenameSymbolAtPosition(
-        filePath: string,
-        position: Position,
-        isDefaultWorkspace: boolean,
-        allowModuleRename: boolean,
-        token: CancellationToken
-    ): { range: Range; declarations: Declaration[] } | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(sourceFileInfo);
-            const referencesResult = this._getReferenceResult(
-                sourceFileInfo,
-                filePath,
-                position,
-                allowModuleRename,
-                token
-            );
-            if (!referencesResult) {
-                return undefined;
-            }
-
-            if (
-                referencesResult.containsOnlyImportDecls &&
-                !this._supportRenameModule(referencesResult.declarations, isDefaultWorkspace)
-            ) {
-                return undefined;
-            }
-
-            const renameMode = this._getRenameSymbolMode(sourceFileInfo, referencesResult, isDefaultWorkspace);
-            if (renameMode === 'none') {
-                return undefined;
-            }
-
-            // Return the range of the symbol.
-            const parseResult = sourceFileInfo.sourceFile.getParseResults()!;
-            return {
-                range: convertTextRangeToRange(referencesResult.nodeAtOffset, parseResult.tokenizerOutput.lines),
-                declarations: referencesResult.declarations,
-            };
-        });
-    }
-
-    renameSymbolAtPosition(
-        filePath: string,
-        position: Position,
-        newName: string,
-        isDefaultWorkspace: boolean,
-        allowModuleRename: boolean,
-        token: CancellationToken
-    ): FileEditActions | undefined {
-        return this._runEvaluatorWithCancellationToken(token, () => {
-            const sourceFileInfo = this.getSourceFileInfo(filePath);
-            if (!sourceFileInfo) {
-                return undefined;
-            }
-
-            this._bindFile(sourceFileInfo);
-
-            const referencesResult = this._getReferenceResult(
-                sourceFileInfo,
-                filePath,
-                position,
-                allowModuleRename,
-                token
-            );
-            if (!referencesResult) {
-                return undefined;
-            }
-
-            if (referencesResult.containsOnlyImportDecls) {
-                // All decls must be on a user file.
-                if (!this._supportRenameModule(referencesResult.declarations, isDefaultWorkspace)) {
-                    return undefined;
-                }
-
-                const moduleInfo = RenameModuleProvider.getRenameModulePathInfo(
-                    RenameModuleProvider.getRenameModulePath(referencesResult.declarations),
-                    newName
-                );
-                if (!moduleInfo) {
-                    // Can't figure out module to rename.
-                    return undefined;
-                }
-
-                const editActions = this.renameModule(moduleInfo.filePath, moduleInfo.newFilePath, token);
-
-                // Add file system rename.
-                editActions?.fileOperations.push({
-                    kind: 'rename',
-                    oldFilePath: moduleInfo.filePath,
-                    newFilePath: moduleInfo.newFilePath,
-                });
-
-                if (isStubFile(moduleInfo.filePath)) {
-                    const matchingFiles = this._importResolver.getSourceFilesFromStub(
-                        moduleInfo.filePath,
-                        this._configOptions.findExecEnvironment(filePath),
-                        /* mapCompiled */ false
-                    );
-
-                    for (const matchingFile of matchingFiles) {
-                        const matchingFileInfo = RenameModuleProvider.getRenameModulePathInfo(matchingFile, newName);
-                        if (matchingFileInfo) {
-                            editActions?.fileOperations.push({
-                                kind: 'rename',
-                                oldFilePath: matchingFileInfo.filePath,
-                                newFilePath: matchingFileInfo.newFilePath,
-                            });
-                        }
-                    }
-                }
-
-                return editActions;
-            }
-
-            const renameMode = this._getRenameSymbolMode(sourceFileInfo, referencesResult, isDefaultWorkspace);
-            switch (renameMode) {
-                case 'singleFileMode':
-                    sourceFileInfo.sourceFile.addReferences(referencesResult, true, this._evaluator!, token);
-                    break;
-
-                case 'multiFileMode': {
-                    for (const curSourceFileInfo of this._sourceFileList) {
-                        // Make sure we only add user code to the references to prevent us
-                        // from accidentally changing third party library or type stub.
-                        if (isUserCode(curSourceFileInfo)) {
-                            // Make sure searching symbol name exists in the file.
-                            const content = curSourceFileInfo.sourceFile.getFileContent() ?? '';
-                            if (content.indexOf(referencesResult.symbolName) < 0) {
-                                continue;
-                            }
-
-                            this._bindFile(curSourceFileInfo, content);
-                            curSourceFileInfo.sourceFile.addReferences(referencesResult, true, this._evaluator!, token);
-                        }
-
-                        // This operation can consume significant memory, so check
-                        // for situations where we need to discard the type cache.
-                        this._handleMemoryHighUsage();
-                    }
-                    break;
-                }
-
-                case 'none':
-                    // Rename is not allowed.
-                    // ex) rename symbols from libraries.
-                    return undefined;
-
-                default:
-                    assertNever(renameMode);
-            }
-
-            const edits: FileEditAction[] = [];
-            referencesResult.locations.forEach((loc) => {
-                edits.push({
-                    filePath: loc.path,
-                    range: loc.range,
-                    replacementText: newName,
-                });
-            });
-
-            return { edits, fileOperations: [] };
-        });
-    }
-
-    getCallForPosition(filePath: string, position: Position, token: CancellationToken): CallHierarchyItem | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        if (!sourceFileInfo) {
-            return undefined;
-        }
-        this._bindFile(sourceFileInfo);
-
-        const execEnv = this._configOptions.findExecEnvironment(filePath);
-        const referencesResult = sourceFileInfo.sourceFile.getDeclarationForPosition(
-            this._createSourceMapper(execEnv, token, sourceFileInfo),
-            position,
-            this._evaluator!,
-            undefined,
-            token
-        );
-
-        if (!referencesResult || referencesResult.declarations.length === 0) {
-            return undefined;
         }
 
-        const targetDecl = CallHierarchyProvider.getTargetDeclaration(
-            referencesResult.declarations,
-            referencesResult.nodeAtOffset
-        );
-
-        return CallHierarchyProvider.getCallForDeclaration(
-            referencesResult.symbolName,
-            targetDecl,
-            this._evaluator!,
-            token
-        );
-    }
-
-    getIncomingCallsForPosition(
-        filePath: string,
-        position: Position,
-        token: CancellationToken
-    ): CallHierarchyIncomingCall[] | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        if (!sourceFileInfo) {
-            return undefined;
-        }
-        this._bindFile(sourceFileInfo);
-
-        const execEnv = this._configOptions.findExecEnvironment(filePath);
-        const referencesResult = sourceFileInfo.sourceFile.getDeclarationForPosition(
-            this._createSourceMapper(execEnv, token, sourceFileInfo),
-            position,
-            this._evaluator!,
-            undefined,
-            token
-        );
-
-        if (!referencesResult || referencesResult.declarations.length === 0) {
-            return undefined;
-        }
-
-        const targetDecl = CallHierarchyProvider.getTargetDeclaration(
-            referencesResult.declarations,
-            referencesResult.nodeAtOffset
-        );
-        let items: CallHierarchyIncomingCall[] = [];
-
-        for (const curSourceFileInfo of this._sourceFileList) {
-            if (isUserCode(curSourceFileInfo) || curSourceFileInfo.isOpenByClient) {
-                this._bindFile(curSourceFileInfo);
-
-                const itemsToAdd = CallHierarchyProvider.getIncomingCallsForDeclaration(
-                    curSourceFileInfo.sourceFile.getFilePath(),
-                    referencesResult.symbolName,
-                    targetDecl,
-                    curSourceFileInfo.sourceFile.getParseResults()!,
-                    this._evaluator!,
-                    token
-                );
-
-                if (itemsToAdd) {
-                    items = items.concat(...itemsToAdd);
-                }
-
-                // This operation can consume significant memory, so check
-                // for situations where we need to discard the type cache.
-                this._handleMemoryHighUsage();
-            }
-        }
-
-        return items;
-    }
-
-    getOutgoingCallsForPosition(
-        filePath: string,
-        position: Position,
-        token: CancellationToken
-    ): CallHierarchyOutgoingCall[] | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        if (!sourceFileInfo) {
-            return undefined;
-        }
-        this._bindFile(sourceFileInfo);
-
-        const execEnv = this._configOptions.findExecEnvironment(filePath);
-        const referencesResult = sourceFileInfo.sourceFile.getDeclarationForPosition(
-            this._createSourceMapper(execEnv, token, sourceFileInfo),
-            position,
-            this._evaluator!,
-            undefined,
-            token
-        );
-
-        if (!referencesResult || referencesResult.declarations.length === 0) {
-            return undefined;
-        }
-        const targetDecl = CallHierarchyProvider.getTargetDeclaration(
-            referencesResult.declarations,
-            referencesResult.nodeAtOffset
-        );
-
-        return CallHierarchyProvider.getOutgoingCallsForDeclaration(
-            targetDecl,
-            sourceFileInfo.sourceFile.getParseResults()!,
-            this._evaluator!,
-            token
-        );
-    }
-
-    performQuickAction(
-        filePath: string,
-        command: string,
-        args: any[],
-        token: CancellationToken
-    ): TextEditAction[] | undefined {
-        const sourceFileInfo = this.getSourceFileInfo(filePath);
-        if (!sourceFileInfo) {
-            return undefined;
-        }
-
-        this._bindFile(sourceFileInfo);
-
-        return sourceFileInfo.sourceFile.performQuickAction(command, args, token);
+        return program;
     }
 
     // Returns a value from 0 to 1 (or more) indicating how "full" the cache is
@@ -2263,135 +1000,22 @@ export class Program {
         this._createNewEvaluator();
         this._discardCachedParseResults();
         this._parsedFileCount = 0;
-    }
 
-    test_createSourceMapper(execEnv: ExecutionEnvironment, from?: SourceFileInfo) {
-        return this._createSourceMapper(execEnv, CancellationToken.None, /*from*/ from, /* mapCompiled */ false);
-    }
-
-    private _getRenameSymbolMode(
-        sourceFileInfo: SourceFileInfo,
-        referencesResult: ReferencesResult,
-        isDefaultWorkspace: boolean
-    ) {
-        // We have 2 different cases
-        // Single file mode.
-        // 1. rename on default workspace (ex, standalone file mode).
-        // 2. rename local symbols.
-        // 3. rename symbols defined in the non user open file.
-        //
-        // and Multi file mode.
-        // 1. rename public symbols defined in user files on regular workspace (ex, open folder mode).
-        const userFile = isUserCode(sourceFileInfo);
-        if (
-            isDefaultWorkspace ||
-            (userFile && !referencesResult.requiresGlobalSearch) ||
-            (!userFile &&
-                sourceFileInfo.isOpenByClient &&
-                referencesResult.declarations.every((d) => this.getSourceFileInfo(d.path) === sourceFileInfo))
-        ) {
-            return 'singleFileMode';
-        }
-
-        if (referencesResult.declarations.every((d) => isUserCode(this.getSourceFileInfo(d.path)))) {
-            return 'multiFileMode';
-        }
-
-        // Rename is not allowed.
-        // ex) rename symbols from libraries.
-        return 'none';
-    }
-
-    private _supportRenameModule(declarations: Declaration[], isDefaultWorkspace: boolean) {
-        // Rename module is not supported for standalone file and all decls must be on a user file.
-        return !isDefaultWorkspace && declarations.every((d) => isUserCode(this.getSourceFileInfo(d.path)));
-    }
-
-    private _getReferenceResult(
-        sourceFileInfo: SourceFileInfo,
-        filePath: string,
-        position: Position,
-        allowModuleRename: boolean,
-        token: CancellationToken
-    ) {
-        const execEnv = this._configOptions.findExecEnvironment(filePath);
-        const referencesResult = sourceFileInfo.sourceFile.getDeclarationForPosition(
-            this._createSourceMapper(execEnv, token),
-            position,
-            this._evaluator!,
-            undefined,
-            token
-        );
-
-        if (!referencesResult) {
-            return undefined;
-        }
-
-        if (allowModuleRename && referencesResult.containsOnlyImportDecls) {
-            return referencesResult;
-        }
-
-        if (referencesResult.nonImportDeclarations.length === 0) {
-            // There is no symbol we can rename.
-            return undefined;
-        }
-
-        // Use declarations that doesn't contain import decls.
-        return new ReferencesResult(
-            referencesResult.requiresGlobalSearch,
-            referencesResult.nodeAtOffset,
-            referencesResult.symbolName,
-            referencesResult.nonImportDeclarations
-        );
-    }
-
-    private _processModuleReferences(
-        renameModuleProvider: RenameModuleProvider,
-        filteringText: string,
-        currentFilePath: string
-    ) {
-        // _sourceFileList contains every user files that match "include" pattern including
-        // py file even if corresponding pyi exists.
-        for (const currentFileInfo of this._sourceFileList) {
-            // Make sure we only touch user code to prevent us
-            // from accidentally changing third party library or type stub.
-            if (!isUserCode(currentFileInfo)) {
-                continue;
-            }
-
-            // If module name isn't mentioned in the current file, skip the file
-            // except the file that got actually renamed/moved.
-            // The file that got moved might have relative import paths we need to update.
-            const filePath = currentFileInfo.sourceFile.getFilePath();
-            const content = currentFileInfo.sourceFile.getFileContent() ?? '';
-            if (filePath !== currentFilePath && content.indexOf(filteringText) < 0) {
-                continue;
-            }
-
-            this._bindFile(currentFileInfo, content);
-            const parseResult = currentFileInfo.sourceFile.getParseResults();
-            if (!parseResult) {
-                continue;
-            }
-
-            renameModuleProvider.renameReferences(filePath, parseResult);
-
-            // This operation can consume significant memory, so check
-            // for situations where we need to discard the type cache.
-            this._handleMemoryHighUsage();
-        }
+        this.serviceProvider.tryGet(ServiceKeys.stateMutationListeners)?.forEach((l) => l.onClearCache?.());
     }
 
     private _handleMemoryHighUsage() {
         const cacheUsage = this._cacheManager.getCacheUsage();
+        const usedHeapRatio = this._cacheManager.getUsedHeapRatio(
+            this._configOptions.verboseOutput ? this._console : undefined
+        );
 
         // If the total cache has exceeded 75%, determine whether we should empty
-        // the cache.
-        if (cacheUsage > 0.75) {
-            const usedHeapRatio = this._cacheManager.getUsedHeapRatio(
-                this._configOptions.verboseOutput ? this._console : undefined
-            );
-
+        // the cache. If the usedHeapRatio has exceeded 90%, we should definitely
+        // empty the cache. This can happen before the cacheUsage maxes out because
+        // we might be on the background thread and a bunch of the cacheUsage is on the main
+        // thread.
+        if (cacheUsage > 0.75 || usedHeapRatio > 0.9) {
             // The type cache uses a Map, which has an absolute limit of 2^24 entries
             // before it will fail. If we cross the 95% mark, we'll empty the cache.
             const absoluteMaxCacheEntryCount = (1 << 24) * 0.9;
@@ -2427,7 +1051,7 @@ export class Program {
             // An unexpected exception occurred, potentially leaving the current evaluator
             // in an inconsistent state. Discard it and replace it with a fresh one. It is
             // Cancellation exceptions are known to handle this correctly.
-            if (!OperationCanceledException.is(e)) {
+            if (!OperationCanceledException.is(e) || e.isTypeCacheInvalid) {
                 this._createNewEvaluator();
             }
             throw e;
@@ -2445,14 +1069,17 @@ export class Program {
         for (let i = 0; i < this._sourceFileList.length; ) {
             const fileInfo = this._sourceFileList[i];
             if (!this._isFileNeeded(fileInfo)) {
-                fileDiagnostics.push({
-                    filePath: fileInfo.sourceFile.getFilePath(),
-                    version: fileInfo.sourceFile.getClientVersion(),
-                    diagnostics: [],
-                });
+                // Clear only if there are any errors for this file.
+                if (fileInfo.diagnosticsVersion !== undefined) {
+                    fileDiagnostics.push({
+                        fileUri: fileInfo.sourceFile.getUri(),
+                        version: fileInfo.sourceFile.getClientVersion(),
+                        diagnostics: [],
+                    });
+                }
 
                 fileInfo.sourceFile.prepareForClose();
-                this._removeSourceFileFromListAndMap(fileInfo.sourceFile.getFilePath(), i);
+                this._removeSourceFileFromListAndMap(fileInfo.sourceFile.getUri(), i);
 
                 // Unlink any imports and remove them from the list if
                 // they are no longer referenced.
@@ -2462,7 +1089,7 @@ export class Program {
                         return;
                     }
 
-                    importedFile.importedBy.splice(indexToRemove, 1);
+                    importedFile.mutate((s) => s.importedBy.splice(indexToRemove, 1));
 
                     // See if we need to remove the imported file because it
                     // is no longer needed. If its index is >= i, it will be
@@ -2470,14 +1097,17 @@ export class Program {
                     if (!this._isFileNeeded(importedFile)) {
                         const indexToRemove = this._sourceFileList.findIndex((fi) => fi === importedFile);
                         if (indexToRemove >= 0 && indexToRemove < i) {
-                            fileDiagnostics.push({
-                                filePath: importedFile.sourceFile.getFilePath(),
-                                version: importedFile.sourceFile.getClientVersion(),
-                                diagnostics: [],
-                            });
+                            // Clear if there are any errors for this import.
+                            if (importedFile.diagnosticsVersion !== undefined) {
+                                fileDiagnostics.push({
+                                    fileUri: importedFile.sourceFile.getUri(),
+                                    version: importedFile.sourceFile.getClientVersion(),
+                                    diagnostics: [],
+                                });
+                            }
 
                             importedFile.sourceFile.prepareForClose();
-                            this._removeSourceFileFromListAndMap(importedFile.sourceFile.getFilePath(), indexToRemove);
+                            this._removeSourceFileFromListAndMap(importedFile.sourceFile.getUri(), indexToRemove);
                             i--;
                         }
                     }
@@ -2485,15 +1115,15 @@ export class Program {
 
                 // Remove any shadowed files corresponding to this file.
                 fileInfo.shadowedBy.forEach((shadowedFile) => {
-                    shadowedFile.shadows = shadowedFile.shadows.filter((f) => f !== fileInfo);
+                    shadowedFile.mutate((s) => (s.shadows = s.shadows.filter((f) => f !== fileInfo)));
                 });
-                fileInfo.shadowedBy = [];
+                fileInfo.mutate((s) => (s.shadowedBy = []));
             } else {
                 // If we're showing the user errors only for open files, clear
                 // out the errors for the now-closed file.
                 if (!this._shouldCheckFile(fileInfo) && fileInfo.diagnosticsVersion !== undefined) {
                     fileDiagnostics.push({
-                        filePath: fileInfo.sourceFile.getFilePath(),
+                        fileUri: fileInfo.sourceFile.getUri(),
                         version: fileInfo.sourceFile.getClientVersion(),
                         diagnostics: [],
                     });
@@ -2507,12 +1137,12 @@ export class Program {
         return fileDiagnostics;
     }
 
-    private _isFileNeeded(fileInfo: SourceFileInfo) {
+    private _isFileNeeded(fileInfo: SourceFileInfo, skipFileNeededCheck?: boolean) {
         if (fileInfo.sourceFile.isFileDeleted()) {
             return false;
         }
 
-        if (fileInfo.isTracked || fileInfo.isOpenByClient) {
+        if (!!skipFileNeededCheck || fileInfo.isTracked || fileInfo.isOpenByClient) {
             return true;
         }
 
@@ -2536,14 +1166,14 @@ export class Program {
             return true;
         }
 
-        const filePath = normalizePathCase(this._fs, fileInfo.sourceFile.getFilePath());
+        const fileUri = fileInfo.sourceFile.getUri();
 
         // Avoid infinite recursion.
-        if (recursionSet.has(filePath)) {
+        if (recursionSet.has(fileUri.key)) {
             return false;
         }
 
-        recursionSet.add(filePath);
+        recursionSet.add(fileUri.key);
 
         for (const importerInfo of fileInfo.importedBy) {
             if (this._isImportNeededRecursive(importerInfo, recursionSet)) {
@@ -2565,16 +1195,41 @@ export class Program {
             this._importResolver,
             execEnv,
             this._evaluator!,
-            (stubFilePath: string, implFilePath: string) => {
-                const stubFileInfo = this.getSourceFileInfo(stubFilePath);
+            (stubFileUri: Uri, implFileUri: Uri) => {
+                let stubFileInfo = this.getSourceFileInfo(stubFileUri);
                 if (!stubFileInfo) {
-                    return undefined;
+                    // make sure uri exits before adding interimFile
+                    if (!this.fileSystem.existsSync(stubFileUri)) {
+                        return undefined;
+                    }
+
+                    // Special case for import statement like "import X.Y". The SourceFile
+                    // for X might not be in memory since import `X.Y` only brings in Y.
+                    stubFileInfo = this.addInterimFile(stubFileUri);
                 }
-                this._addShadowedFile(stubFileInfo, implFilePath);
-                return this.getBoundSourceFile(implFilePath);
+
+                this._addShadowedFile(stubFileInfo, implFileUri);
+                return this.getBoundSourceFile(implFileUri);
             },
-            (f) => this.getBoundSourceFileInfo(f),
-            (f) => this.getSourceFileInfo(f),
+            (f) => {
+                let fileInfo = this.getBoundSourceFileInfo(f);
+                if (!fileInfo) {
+                    // make sure uri exits before adding interimFile
+                    if (!this.fileSystem.existsSync(f)) {
+                        return undefined;
+                    }
+
+                    // Special case for import statement like "import X.Y". The SourceFile
+                    // for X might not be in memory since import `X.Y` only brings in Y.
+                    fileInfo = this.addInterimFile(f);
+
+                    // Even though this file is not referenced by anything, make sure
+                    // we have a parse tree for the doc string.
+                    this._parseFile(fileInfo, /* content */ undefined, /* force */ true);
+                }
+
+                return fileInfo;
+            },
             mapCompiled ?? false,
             preferStubs ?? false,
             from,
@@ -2622,12 +1277,21 @@ export class Program {
                 ) {
                     thirdPartyImportAllowed = true;
                 }
-            } else if (importer.isThirdPartyImport) {
+            } else if (importer.isThirdPartyImport && this._configOptions.useLibraryCodeForTypes) {
                 // If the importing file is a third-party import, allow importing of
                 // additional third-party imports. This supports the case where the importer
                 // is in a py.typed library but is importing from another non-py.typed
                 // library. It also supports the case where someone explicitly opens a
                 // library source file in their editor.
+                thirdPartyImportAllowed = true;
+            } else if (
+                importResult.isNamespacePackage &&
+                Array.from(importResult.filteredImplicitImports.values()).some(
+                    (implicitImport) => !!implicitImport.pyTypedInfo
+                )
+            ) {
+                // Handle the case where the import targets a namespace package, and a
+                // submodule contained within it has a py.typed marker.
                 thirdPartyImportAllowed = true;
             }
 
@@ -2641,6 +1305,10 @@ export class Program {
         }
 
         return true;
+    }
+
+    private _getSourceFileInfoFromKey(key: string) {
+        return this._sourceFileMap.get(key);
     }
 
     private _updateSourceFileImports(sourceFileInfo: SourceFileInfo, options: ConfigOptions): SourceFileInfo[] {
@@ -2685,9 +1353,9 @@ export class Program {
             if (sourceFileInfo.chainedSourceFile.sourceFile.isFileDeleted()) {
                 sourceFileInfo.chainedSourceFile = undefined;
             } else {
-                const filePath = sourceFileInfo.chainedSourceFile.sourceFile.getFilePath();
-                newImportPathMap.set(normalizePathCase(this._fs, filePath), {
-                    path: filePath,
+                const fileUri = sourceFileInfo.chainedSourceFile.sourceFile.getUri();
+                newImportPathMap.set(fileUri.key, {
+                    path: fileUri,
                     isTypeshedFile: false,
                     isThirdPartyImport: false,
                     isPyTypedPresent: false,
@@ -2698,12 +1366,12 @@ export class Program {
         imports.forEach((importResult) => {
             if (importResult.isImportFound) {
                 if (this._isImportAllowed(sourceFileInfo, importResult, importResult.isStubFile)) {
-                    if (importResult.resolvedPaths.length > 0) {
-                        const filePath = importResult.resolvedPaths[importResult.resolvedPaths.length - 1];
-                        if (filePath) {
+                    if (importResult.resolvedUris.length > 0) {
+                        const fileUri = importResult.resolvedUris[importResult.resolvedUris.length - 1];
+                        if (!fileUri.isEmpty()) {
                             const thirdPartyTypeInfo = getThirdPartyImportInfo(importResult);
-                            newImportPathMap.set(normalizePathCase(this._fs, filePath), {
-                                path: filePath,
+                            newImportPathMap.set(fileUri.key, {
+                                path: fileUri,
                                 isTypeshedFile:
                                     !!importResult.isStdlibTypeshedFile || !!importResult.isThirdPartyTypeshedFile,
                                 isThirdPartyImport: thirdPartyTypeInfo.isThirdPartyImport,
@@ -2717,8 +1385,8 @@ export class Program {
                     if (this._isImportAllowed(sourceFileInfo, importResult, implicitImport.isStubFile)) {
                         if (!implicitImport.isNativeLib) {
                             const thirdPartyTypeInfo = getThirdPartyImportInfo(importResult);
-                            newImportPathMap.set(normalizePathCase(this._fs, implicitImport.path), {
-                                path: implicitImport.path,
+                            newImportPathMap.set(implicitImport.uri.key, {
+                                path: implicitImport.uri,
                                 isTypeshedFile:
                                     !!importResult.isStdlibTypeshedFile || !!importResult.isThirdPartyTypeshedFile,
                                 isThirdPartyImport: thirdPartyTypeInfo.isThirdPartyImport,
@@ -2738,7 +1406,7 @@ export class Program {
                         if (options.verboseOutput) {
                             this._console.info(
                                 `Could not resolve source for '${importResult.importName}' ` +
-                                    `in file '${sourceFileInfo.sourceFile.getFilePath()}'`
+                                    `in file '${sourceFileInfo.sourceFile.getUri().toUserVisibleString()}'`
                             );
 
                             if (importResult.nonStubImportResult.importFailureInfo) {
@@ -2752,7 +1420,7 @@ export class Program {
             } else if (options.verboseOutput) {
                 this._console.info(
                     `Could not import '${importResult.importName}' ` +
-                        `in file '${sourceFileInfo.sourceFile.getFilePath()}'`
+                        `in file '${sourceFileInfo.sourceFile.getUri().toUserVisibleString()}'`
                 );
                 if (importResult.importFailureInfo) {
                     importResult.importFailureInfo.forEach((diag) => {
@@ -2764,17 +1432,17 @@ export class Program {
 
         const updatedImportMap = new Map<string, SourceFileInfo>();
         sourceFileInfo.imports.forEach((importInfo) => {
-            const oldFilePath = normalizePathCase(this._fs, importInfo.sourceFile.getFilePath());
+            const oldFilePath = importInfo.sourceFile.getUri();
 
             // A previous import was removed.
-            if (!newImportPathMap.has(oldFilePath)) {
-                importInfo.importedBy = importInfo.importedBy.filter(
-                    (fi) =>
-                        normalizePathCase(this._fs, fi.sourceFile.getFilePath()) !==
-                        normalizePathCase(this._fs, sourceFileInfo.sourceFile.getFilePath())
-                );
+            if (!newImportPathMap.has(oldFilePath.key)) {
+                importInfo.mutate((s) => {
+                    s.importedBy = s.importedBy.filter(
+                        (fi) => !fi.sourceFile.getUri().equals(sourceFileInfo.sourceFile.getUri())
+                    );
+                });
             } else {
-                updatedImportMap.set(oldFilePath, importInfo);
+                updatedImportMap.set(oldFilePath.key, importInfo);
             }
         });
 
@@ -2783,86 +1451,760 @@ export class Program {
             if (!updatedImportMap.has(normalizedImportPath)) {
                 // We found a new import to add. See if it's already part
                 // of the program.
-                let importedFileInfo: SourceFileInfo;
-                if (this.getSourceFileInfo(importInfo.path)) {
-                    importedFileInfo = this.getSourceFileInfo(importInfo.path)!;
-                } else {
-                    const importName = this._getImportNameForFile(importInfo.path);
-                    const sourceFile = new SourceFile(
-                        this._fs,
+                let importedFileInfo = this.getSourceFileInfo(importInfo.path);
+                if (!importedFileInfo) {
+                    const moduleImportInfo = this._getModuleImportInfoForFile(importInfo.path);
+                    const sourceFile = this._sourceFileFactory.createSourceFile(
+                        this.serviceProvider,
                         importInfo.path,
-                        importName,
+                        moduleImportInfo.moduleName,
                         importInfo.isThirdPartyImport,
                         importInfo.isPyTypedPresent,
+                        this._editModeTracker,
                         this._console,
                         this._logTracker
                     );
-                    importedFileInfo = {
+                    importedFileInfo = new SourceFileInfo(
                         sourceFile,
-                        isTracked: false,
-                        isOpenByClient: false,
-                        isTypeshedFile: importInfo.isTypeshedFile,
-                        isThirdPartyImport: importInfo.isThirdPartyImport,
-                        isThirdPartyPyTypedPresent: importInfo.isPyTypedPresent,
-                        diagnosticsVersion: undefined,
-                        imports: [],
-                        importedBy: [],
-                        shadows: [],
-                        shadowedBy: [],
-                    };
+                        importInfo.isTypeshedFile,
+                        importInfo.isThirdPartyImport,
+                        importInfo.isPyTypedPresent,
+                        this._editModeTracker
+                    );
 
                     this._addToSourceFileListAndMap(importedFileInfo);
                     filesAdded.push(importedFileInfo);
                 }
 
-                importedFileInfo.importedBy.push(sourceFileInfo);
+                importedFileInfo.mutate((s) => s.importedBy.push(sourceFileInfo));
                 updatedImportMap.set(normalizedImportPath, importedFileInfo);
             }
         });
 
         // Update the imports list. It should now map the set of imports
         // specified by the source file.
-        sourceFileInfo.imports = [];
-        newImportPathMap.forEach((_, path) => {
-            if (this.getSourceFileInfo(path)) {
-                sourceFileInfo.imports.push(this.getSourceFileInfo(path)!);
+        const newImports: SourceFileInfo[] = [];
+        newImportPathMap.forEach((_, key) => {
+            const newImport = this._getSourceFileInfoFromKey(key);
+            if (newImport) {
+                newImports.push(newImport);
             }
         });
+
+        // Mutate only when necessary to avoid extra binding operations.
+        if (
+            newImports.length !== sourceFileInfo.imports.length ||
+            !newImports.every((i) => sourceFileInfo.imports.includes(i))
+        ) {
+            sourceFileInfo.mutate((s) => (s.imports = newImports));
+        }
 
         // Resolve the builtins import for the file. This needs to be
         // analyzed before the file can be analyzed.
         sourceFileInfo.builtinsImport = undefined;
         const builtinsImport = sourceFileInfo.sourceFile.getBuiltinsImport();
         if (builtinsImport && builtinsImport.isImportFound) {
-            const resolvedBuiltinsPath = builtinsImport.resolvedPaths[builtinsImport.resolvedPaths.length - 1];
+            const resolvedBuiltinsPath = builtinsImport.resolvedUris[builtinsImport.resolvedUris.length - 1];
             sourceFileInfo.builtinsImport = this.getSourceFileInfo(resolvedBuiltinsPath);
-        }
-
-        // Resolve the ipython display import for the file. This needs to be
-        // analyzed before the file can be analyzed.
-        sourceFileInfo.ipythonDisplayImport = undefined;
-        const ipythonDisplayImport = sourceFileInfo.sourceFile.getIPythonDisplayImport();
-        if (ipythonDisplayImport && ipythonDisplayImport.isImportFound) {
-            const resolvedIPythonDisplayPath =
-                ipythonDisplayImport.resolvedPaths[ipythonDisplayImport.resolvedPaths.length - 1];
-            sourceFileInfo.ipythonDisplayImport = this.getSourceFileInfo(resolvedIPythonDisplayPath);
         }
 
         return filesAdded;
     }
 
-    private _removeSourceFileFromListAndMap(filePath: string, indexToRemove: number) {
-        this._sourceFileMap.delete(normalizePathCase(this._fs, filePath));
+    private _removeSourceFileFromListAndMap(fileUri: Uri, indexToRemove: number) {
+        this._sourceFileMap.delete(fileUri.key);
         this._sourceFileList.splice(indexToRemove, 1);
     }
 
     private _addToSourceFileListAndMap(fileInfo: SourceFileInfo) {
-        const filePath = normalizePathCase(this._fs, fileInfo.sourceFile.getFilePath());
+        const fileUri = fileInfo.sourceFile.getUri();
 
         // We should never add a file with the same path twice.
-        assert(!this._sourceFileMap.has(filePath));
+        assert(!this._sourceFileMap.has(fileUri.key));
+
+        // We should never have an empty URI for a source file.
+        assert(!fileUri.isEmpty());
 
         this._sourceFileList.push(fileInfo);
-        this._sourceFileMap.set(filePath, fileInfo);
+        this._sourceFileMap.set(fileUri.key, fileInfo);
+    }
+
+    private static _getPrintTypeFlags(configOptions: ConfigOptions): PrintTypeFlags {
+        let flags = PrintTypeFlags.None;
+
+        if (configOptions.diagnosticRuleSet.printUnknownAsAny) {
+            flags |= PrintTypeFlags.PrintUnknownWithAny;
+        }
+
+        if (configOptions.diagnosticRuleSet.omitConditionalConstraint) {
+            flags |= PrintTypeFlags.OmitConditionalConstraint;
+        }
+
+        if (configOptions.diagnosticRuleSet.omitTypeArgsIfUnknown) {
+            flags |= PrintTypeFlags.OmitTypeArgsIfUnknown;
+        }
+
+        if (configOptions.diagnosticRuleSet.omitUnannotatedParamType) {
+            flags |= PrintTypeFlags.OmitUnannotatedParamType;
+        }
+
+        if (configOptions.diagnosticRuleSet.pep604Printing) {
+            flags |= PrintTypeFlags.PEP604;
+        }
+
+        return flags;
+    }
+
+    private _getModuleImportInfoForFile(fileUri: Uri) {
+        // We allow illegal module names (e.g. names that include "-" in them)
+        // because we want a unique name for each module even if it cannot be
+        // imported through an "import" statement. It's important to have a
+        // unique name in case two modules declare types with the same local
+        // name. The type checker uses the fully-qualified (unique) module name
+        // to differentiate between such types.
+        const moduleNameAndType = this._importResolver.getModuleNameForImport(
+            fileUri,
+            this._configOptions.getDefaultExecEnvironment(),
+            /* allowIllegalModuleName */ true,
+            /* detectPyTyped */ true
+        );
+
+        return moduleNameAndType;
+    }
+
+    // A "shadowed" file is a python source file that has been added to the program because
+    // it "shadows" a type stub file for purposes of finding doc strings and definitions.
+    // We need to track the relationship so if the original type stub is removed from the
+    // program, we can remove the corresponding shadowed file and any files it imports.
+    private _addShadowedFile(stubFile: SourceFileInfo, shadowImplPath: Uri): SourceFile {
+        let shadowFileInfo = this.getSourceFileInfo(shadowImplPath);
+
+        if (!shadowFileInfo) {
+            shadowFileInfo = this.addInterimFile(shadowImplPath);
+        }
+
+        if (!shadowFileInfo.shadows.includes(stubFile)) {
+            shadowFileInfo.mutate((s) => s.shadows.push(stubFile));
+        }
+
+        if (!stubFile.shadowedBy.includes(shadowFileInfo)) {
+            stubFile.mutate((s) => s.shadowedBy.push(shadowFileInfo!));
+        }
+
+        return shadowFileInfo.sourceFile;
+    }
+
+    private _createInterimFileInfo(fileUri: Uri) {
+        const moduleImportInfo = this._getModuleImportInfoForFile(fileUri);
+        const sourceFile = this._sourceFileFactory.createSourceFile(
+            this.serviceProvider,
+            fileUri,
+            moduleImportInfo.moduleName,
+            /* isThirdPartyImport */ false,
+            /* isInPyTypedPackage */ false,
+            this._editModeTracker,
+            this._console,
+            this._logTracker
+        );
+        const sourceFileInfo = new SourceFileInfo(
+            sourceFile,
+            /* isTypeshedFile */ false,
+            /* isThirdPartyImport */ false,
+            /* isThirdPartyPyTypedPresent */ false,
+            this._editModeTracker
+        );
+
+        return sourceFileInfo;
+    }
+
+    private _createNewEvaluator() {
+        if (this._evaluator) {
+            // We shouldn't need to call this, but there appears to be a bug
+            // in the v8 garbage collector where it's unable to resolve orphaned
+            // objects without us giving it some assistance.
+            this._evaluator.disposeEvaluator();
+        }
+
+        this._evaluator = createTypeEvaluatorWithTracker(
+            this._lookUpImport,
+            {
+                printTypeFlags: Program._getPrintTypeFlags(this._configOptions),
+                logCalls: this._configOptions.logTypeEvaluationTime,
+                minimumLoggingThreshold: this._configOptions.typeEvaluationTimeThreshold,
+                evaluateUnknownImportsAsAny: !!this._configOptions.evaluateUnknownImportsAsAny,
+                verifyTypeCacheEvaluatorFlags: !!this._configOptions.internalTestMode,
+            },
+            this._logTracker,
+            this._configOptions.logTypeEvaluationTime
+                ? createTracePrinter(
+                      this._importResolver.getImportRoots(
+                          this._configOptions.findExecEnvironment(this._configOptions.projectRoot)
+                      )
+                  )
+                : undefined
+        );
+
+        return this._evaluator;
+    }
+
+    private _parseFile(fileToParse: SourceFileInfo, content?: string, skipFileNeededCheck?: boolean) {
+        if (!this._isFileNeeded(fileToParse, skipFileNeededCheck) || !fileToParse.sourceFile.isParseRequired()) {
+            return;
+        }
+
+        // SourceFile.parse should only be called here in the program, as calling it
+        // elsewhere could break the entire dependency graph maintained by the program.
+        // Other parts of the program should use _parseFile to create ParseResults from
+        // the sourceFile. For standalone parseResults, use parseFile or the Parser directly.
+        if (fileToParse.sourceFile.parse(this._configOptions, this._importResolver, content)) {
+            this._parsedFileCount++;
+            this._updateSourceFileImports(fileToParse, this._configOptions);
+        }
+
+        if (fileToParse.sourceFile.isFileDeleted()) {
+            fileToParse.isTracked = false;
+
+            // Mark any files that depend on this file as dirty
+            // also. This will retrigger analysis of these other files.
+            const markDirtySet = new Set<string>();
+            this._markFileDirtyRecursive(fileToParse, markDirtySet);
+
+            // Invalidate the import resolver's cache as well.
+            this._importResolver.invalidateCache();
+        }
+    }
+
+    private _getImplicitImports(file: SourceFileInfo) {
+        // If file is builtins.pyi, then chainedSourceFile might not exist or be incorrect.
+        if (file.builtinsImport === file) {
+            return undefined;
+        }
+
+        if (file.chainedSourceFile && !file.chainedSourceFile.sourceFile.isFileDeleted()) {
+            return file.chainedSourceFile;
+        }
+
+        return file.builtinsImport;
+    }
+
+    private _bindImplicitImports(fileToAnalyze: SourceFileInfo, skipFileNeededCheck?: boolean) {
+        // Get all of the potential imports for this file.
+        const implicitImports: SourceFileInfo[] = [];
+        const implicitSet = new Set<string>();
+
+        let nextImplicitImport = this._getImplicitImports(fileToAnalyze);
+        while (nextImplicitImport) {
+            const implicitPath = nextImplicitImport.sourceFile.getUri();
+
+            if (implicitSet.has(implicitPath.key)) {
+                // We've found a cycle. Break out of the loop.
+                debug.fail(
+                    this.serviceProvider
+                        .tryGet(ServiceKeys.debugInfoInspector)
+                        ?.getCycleDetail(this, nextImplicitImport) ?? `Found a cycle in implicit imports files`
+                );
+            }
+
+            implicitSet.add(implicitPath.key);
+            implicitImports.push(nextImplicitImport);
+
+            this._parseFile(nextImplicitImport, /* content */ undefined, skipFileNeededCheck);
+            nextImplicitImport = this._getImplicitImports(nextImplicitImport);
+        }
+
+        if (implicitImports.length === 0) {
+            return;
+        }
+
+        // Reverse order, so top of chain is first.
+        let implicitImport = implicitImports.pop();
+        while (implicitImport) {
+            // Bind this file but don't recurse into its imports.
+            this._bindFile(implicitImport, /* content */ undefined, skipFileNeededCheck, /* isImplicitImport */ true);
+            implicitImport = implicitImports.pop();
+        }
+    }
+
+    // Binds the specified file. Returns true if the file was bound or it
+    // didn't need to be bound.
+    private _bindFile(
+        fileToBind: SourceFileInfo,
+        content?: string,
+        skipFileNeededCheck = false,
+        isImplicitImport = false
+    ): boolean {
+        if (!this._isFileNeeded(fileToBind, skipFileNeededCheck) || !fileToBind.sourceFile.isBindingRequired()) {
+            return !fileToBind.sourceFile.isBindingRequired();
+        }
+
+        this._parseFile(fileToBind, content, skipFileNeededCheck);
+
+        // Create a function to get the scope info.
+        const getScopeIfAvailable = (fileInfo: SourceFileInfo | undefined) => {
+            if (!fileInfo || fileInfo === fileToBind) {
+                return undefined;
+            }
+
+            // If the file was deleted, there's no scope to return.
+            if (fileInfo.sourceFile.isFileDeleted()) {
+                return undefined;
+            }
+
+            const parseResults = fileInfo.sourceFile.getParserOutput();
+            if (!parseResults) {
+                return undefined;
+            }
+
+            // File should already be bound because of the chained file binding above.
+            const scope = AnalyzerNodeInfo.getScope(parseResults.parseTree);
+            return scope;
+        };
+
+        let builtinsScope: Scope | undefined;
+        if (fileToBind.builtinsImport && fileToBind.builtinsImport !== fileToBind) {
+            // Bind all of the implicit imports first. So we don't recurse into them.
+            if (!isImplicitImport) {
+                this._bindImplicitImports(fileToBind);
+            }
+
+            // If it is not builtin module itself, we need to parse and bind
+            // the builtin module.
+            builtinsScope =
+                getScopeIfAvailable(fileToBind.chainedSourceFile) ?? getScopeIfAvailable(fileToBind.builtinsImport);
+        }
+
+        let futureImports = fileToBind.sourceFile.getParserOutput()!.futureImports;
+        if (fileToBind.chainedSourceFile) {
+            futureImports = this._getEffectiveFutureImports(futureImports, fileToBind.chainedSourceFile);
+        }
+        fileToBind.effectiveFutureImports = futureImports.size > 0 ? futureImports : undefined;
+
+        fileToBind.sourceFile.bind(this._configOptions, this._lookUpImport, builtinsScope, futureImports);
+        return true;
+    }
+
+    private _getEffectiveFutureImports(futureImports: Set<string>, chainedSourceFile: SourceFileInfo): Set<string> {
+        const effectiveFutureImports = new Set<string>(futureImports);
+
+        chainedSourceFile.effectiveFutureImports?.forEach((value) => {
+            effectiveFutureImports.add(value);
+        });
+
+        return effectiveFutureImports;
+    }
+
+    private _lookUpImport = (
+        fileUriOrModule: Uri | AbsoluteModuleDescriptor,
+        options?: LookupImportOptions
+    ): ImportLookupResult | undefined => {
+        let sourceFileInfo: SourceFileInfo | undefined;
+
+        if (Uri.is(fileUriOrModule)) {
+            sourceFileInfo = this.getSourceFileInfo(fileUriOrModule);
+        } else {
+            // Resolve the import.
+            const importResult = this._importResolver.resolveImport(
+                fileUriOrModule.importingFileUri,
+                this._configOptions.findExecEnvironment(fileUriOrModule.importingFileUri),
+                {
+                    leadingDots: 0,
+                    nameParts: fileUriOrModule.nameParts,
+                    importedSymbols: undefined,
+                }
+            );
+
+            if (importResult.isImportFound && !importResult.isNativeLib && importResult.resolvedUris.length > 0) {
+                const resolvedPath = importResult.resolvedUris[importResult.resolvedUris.length - 1];
+                if (!resolvedPath.isEmpty()) {
+                    // See if the source file already exists in the program.
+                    sourceFileInfo = this.getSourceFileInfo(resolvedPath);
+
+                    if (!sourceFileInfo) {
+                        // Start tracking the source file.
+                        this.addTrackedFile(resolvedPath);
+                        sourceFileInfo = this.getSourceFileInfo(resolvedPath);
+                    }
+                }
+            }
+        }
+
+        if (!sourceFileInfo) {
+            return undefined;
+        }
+
+        if (options?.skipParsing) {
+            // Return dummy information if the caller has indicated that parsing is
+            // unnecessary. This is used in cases where the caller simply wants to
+            // know if the source file exists but is not interested in the contents.
+            return {
+                symbolTable: new Map<string, Symbol>(),
+                dunderAllNames: undefined,
+                usesUnsupportedDunderAllForm: false,
+                get docString() {
+                    return undefined;
+                },
+                isInPyTypedPackage: false,
+            };
+        }
+
+        if (sourceFileInfo.sourceFile.isBindingRequired()) {
+            // Bind the file if it's not already bound. Don't count this time
+            // against the type checker.
+            timingStats.typeCheckerTime.subtractFromTime(() => {
+                this._bindFile(sourceFileInfo!, /* content */ undefined, options?.skipFileNeededCheck);
+            });
+        }
+
+        const symbolTable = sourceFileInfo.sourceFile.getModuleSymbolTable();
+        if (!symbolTable) {
+            return undefined;
+        }
+
+        const parseResults = sourceFileInfo.sourceFile.getParserOutput();
+        const moduleNode = parseResults!.parseTree;
+        const fileInfo = AnalyzerNodeInfo.getFileInfo(moduleNode);
+
+        const dunderAllInfo = AnalyzerNodeInfo.getDunderAllInfo(parseResults!.parseTree);
+
+        return {
+            symbolTable,
+            dunderAllNames: dunderAllInfo?.names,
+            usesUnsupportedDunderAllForm: dunderAllInfo?.usesUnsupportedDunderAllForm ?? false,
+            get docString() {
+                return getDocString(moduleNode.d.statements);
+            },
+            isInPyTypedPackage: fileInfo.isInPyTypedPackage,
+        };
+    };
+
+    private _shouldCheckFile(fileInfo: SourceFileInfo) {
+        // Always do a full checking for a file that's open in the editor.
+        if (fileInfo.isOpenByClient) {
+            return true;
+        }
+
+        // If the file isn't currently open, only perform full checking for
+        // files that are tracked, and only if the checkOnlyOpenFiles is disabled.
+        if (!this._configOptions.checkOnlyOpenFiles && fileInfo.isTracked) {
+            return true;
+        }
+
+        return false;
+    }
+
+    private _checkTypes(fileToCheck: SourceFileInfo, token: CancellationToken, chainedByList?: SourceFileInfo[]) {
+        return this._logTracker.log(`analyzing: ${fileToCheck.sourceFile.getUri()}`, (logState) => {
+            // If the file isn't needed because it was eliminated from the
+            // transitive closure or deleted, skip the file rather than wasting
+            // time on it.
+            if (!this._isFileNeeded(fileToCheck)) {
+                logState.suppress();
+                return false;
+            }
+
+            if (!fileToCheck.sourceFile.isCheckingRequired()) {
+                logState.suppress();
+                return false;
+            }
+
+            if (!this._shouldCheckFile(fileToCheck)) {
+                logState.suppress();
+                return false;
+            }
+
+            // Bind the file if necessary even if we're not going to run the checker.
+            // disableChecker means disable semantic errors, not syntax errors. We need to bind again
+            // in order to generate syntax errors.
+            const boundFile = this._bindFile(
+                fileToCheck,
+                undefined,
+                // If binding is required we want to make sure to bind the file, otherwise
+                // the sourceFile.check below will fail.
+                /* skipFileNeededCheck */ fileToCheck.sourceFile.isBindingRequired()
+            );
+
+            if (!this._disableChecker) {
+                // For ipython, make sure we check all its dependent files first since
+                // their results can affect this file's result.
+                const dependentFiles = this._checkDependentFiles(fileToCheck, chainedByList, token);
+
+                if (this._preCheckCallback) {
+                    const parseResults = fileToCheck.sourceFile.getParserOutput();
+                    if (parseResults) {
+                        this._preCheckCallback(parseResults, this._evaluator!);
+                    }
+                }
+
+                if (boundFile) {
+                    const execEnv = this._configOptions.findExecEnvironment(fileToCheck.sourceFile.getUri());
+                    fileToCheck.sourceFile.check(
+                        this.configOptions,
+                        this._importResolver,
+                        this._evaluator!,
+                        this._createSourceMapper(execEnv, token, fileToCheck),
+                        dependentFiles
+                    );
+                }
+            }
+
+            // For very large programs, we may need to discard the evaluator and
+            // its cached types to avoid running out of heap space.
+            this._handleMemoryHighUsage();
+
+            // Detect import cycles that involve the file.
+            if (this._configOptions.diagnosticRuleSet.reportImportCycles !== 'none') {
+                // Don't detect import cycles when doing type stub generation. Some
+                // third-party modules are pretty convoluted.
+                // Or if the file is the notebook cell. notebook cell can't have cycles.
+                if (
+                    !this._allowedThirdPartyImports &&
+                    fileToCheck.sourceFile.getIPythonMode() !== IPythonMode.CellDocs
+                ) {
+                    // We need to force all of the files to be parsed and build
+                    // a closure map for the files.
+                    const closureMap = new Map<string, SourceFileInfo>();
+                    this._getImportsRecursive(fileToCheck, closureMap, 0);
+
+                    closureMap.forEach((file) => {
+                        timingStats.cycleDetectionTime.timeOperation(() => {
+                            const filesVisitedMap = new Map<string, SourceFileInfo>();
+
+                            if (!this._detectAndReportImportCycles(file, filesVisitedMap)) {
+                                // If no cycles were found in any of the files we visited,
+                                // set a flag to indicates that we don't need to visit them again
+                                // on subsequent cycle checks.
+                                filesVisitedMap.forEach((sourceFileInfo) => {
+                                    sourceFileInfo.sourceFile.setNoCircularDependencyConfirmed();
+                                });
+                            }
+                        });
+                    });
+                }
+            }
+
+            return true;
+        });
+    }
+
+    private _checkDependentFiles(
+        fileToCheck: SourceFileInfo,
+        chainedByList: SourceFileInfo[] | undefined,
+        token: CancellationToken
+    ) {
+        if (fileToCheck.sourceFile.getIPythonMode() !== IPythonMode.CellDocs) {
+            return undefined;
+        }
+
+        // If we don't have chainedByList, it means none of them are checked yet.
+        const needToRunChecker = !chainedByList;
+
+        chainedByList = chainedByList ?? createChainedByList(this, fileToCheck);
+        const index = chainedByList.findIndex((v) => v === fileToCheck);
+        if (index < 0) {
+            return undefined;
+        }
+
+        const startIndex = index + 1;
+        if (startIndex >= chainedByList.length) {
+            return undefined;
+        }
+
+        if (needToRunChecker) {
+            // If the file is already analyzed, it will be no op.
+            // And make sure we don't dump parse tree and etc while
+            // calling checker. Otherwise, checkType can dump parse
+            // tree required by outer check.
+            const handle = this._cacheManager.pauseTracking();
+            try {
+                for (let i = chainedByList.length - 1; i >= startIndex; i--) {
+                    this._checkTypes(chainedByList[i], token, chainedByList);
+                }
+            } finally {
+                handle.dispose();
+            }
+        }
+
+        const dependentFiles = [];
+        for (let i = startIndex; i < chainedByList.length; i++) {
+            const file = chainedByList[i];
+            const parseResults = file?.sourceFile.getParserOutput();
+            if (!parseResults) {
+                continue;
+            }
+
+            // We might not have the file info if binding failed for whatever reasons.
+            // Check whether the file has been bound
+            if (file.sourceFile.isBindingRequired()) {
+                continue;
+            }
+
+            const fileInfo = AnalyzerNodeInfo.getFileInfo(parseResults.parseTree);
+            if (fileInfo.accessedSymbolSet) {
+                dependentFiles.push(parseResults);
+            }
+        }
+
+        return dependentFiles;
+    }
+
+    // Builds a map of files that includes the specified file and all of the files
+    // it imports (recursively) and ensures that all such files. If any of these files
+    // have already been checked (they and their recursive imports have completed the
+    // check phase), they are not included in the results.
+    private _getImportsRecursive(
+        file: SourceFileInfo,
+        closureMap: Map<string, SourceFileInfo>,
+        recursionCount: number
+    ) {
+        // If the file is already in the closure map, we found a cyclical
+        // dependency. Don't recur further.
+        const fileUri = file.sourceFile.getUri();
+        if (closureMap.has(fileUri.key)) {
+            return;
+        }
+
+        // If the import chain is too long, emit an error. Otherwise we
+        // risk blowing the stack.
+        if (recursionCount > _maxImportDepth) {
+            file.sourceFile.setHitMaxImportDepth(_maxImportDepth);
+            return;
+        }
+
+        // Add the file to the closure map.
+        closureMap.set(fileUri.key, file);
+
+        // If this file hasn't already been parsed, parse it now. This will
+        // discover any files it imports. Skip this if the file is part
+        // of a library. We'll assume that no cycles will be generated from
+        // library code or typeshed stubs.
+        if (isUserCode(file)) {
+            this._parseFile(file);
+        }
+
+        // Recursively add the file's imports.
+        for (const importedFileInfo of file.imports) {
+            this._getImportsRecursive(importedFileInfo, closureMap, recursionCount + 1);
+        }
+    }
+
+    private _detectAndReportImportCycles(
+        sourceFileInfo: SourceFileInfo,
+        filesVisited: Map<string, SourceFileInfo>,
+        dependencyChain: SourceFileInfo[] = [],
+        dependencyMap = new Map<string, boolean>()
+    ): boolean {
+        // Don't bother checking for typestub files or third-party files.
+        if (sourceFileInfo.sourceFile.isStubFile() || sourceFileInfo.isThirdPartyImport) {
+            return false;
+        }
+
+        // If we've already confirmed that this source file isn't part of a
+        // cycle, we can skip it entirely.
+        if (sourceFileInfo.sourceFile.isNoCircularDependencyConfirmed()) {
+            return false;
+        }
+
+        const fileUri = sourceFileInfo.sourceFile.getUri();
+
+        filesVisited.set(fileUri.key, sourceFileInfo);
+
+        let detectedCycle = false;
+
+        if (dependencyMap.has(fileUri.key)) {
+            // We detect a cycle (partial or full). A full cycle is one that is
+            // rooted in the file at the start of our dependency chain. A partial
+            // cycle loops back on some other file in the dependency chain. We
+            // will report only full cycles here and leave the reporting of
+            // partial cycles to other passes.
+            detectedCycle = true;
+
+            // Look for chains at least two in length. A file that contains
+            // an "import . from X" will technically create a cycle with
+            // itself, but those are not interesting to report.
+            if (dependencyChain.length > 1 && sourceFileInfo === dependencyChain[0]) {
+                this._logImportCycle(dependencyChain);
+            }
+        } else {
+            // If we've already checked this dependency along
+            // some other path, we can skip it.
+            if (dependencyMap.has(fileUri.key)) {
+                return false;
+            }
+
+            // We use both a map (for fast lookups) and a list
+            // (for ordering information). Set the dependency map
+            // entry to true to indicate that we're actively exploring
+            // that dependency.
+            dependencyMap.set(fileUri.key, true);
+            dependencyChain.push(sourceFileInfo);
+
+            for (const imp of sourceFileInfo.imports) {
+                if (this._detectAndReportImportCycles(imp, filesVisited, dependencyChain, dependencyMap)) {
+                    detectedCycle = true;
+                }
+            }
+
+            // Set the dependencyMap entry to false to indicate that we have
+            // already explored this file and don't need to explore it again.
+            dependencyMap.set(fileUri.key, false);
+            dependencyChain.pop();
+        }
+
+        return detectedCycle;
+    }
+
+    private _logImportCycle(dependencyChain: SourceFileInfo[]) {
+        const circDep = new CircularDependency();
+        dependencyChain.forEach((sourceFileInfo) => {
+            circDep.appendPath(sourceFileInfo.sourceFile.getUri());
+        });
+
+        circDep.normalizeOrder();
+        const firstFilePath = circDep.getPaths()[0];
+        const firstSourceFile = this.getSourceFileInfo(firstFilePath)!;
+        assert(firstSourceFile !== undefined);
+        firstSourceFile.sourceFile.addCircularDependency(this.configOptions, circDep);
+    }
+
+    private _markFileDirtyRecursive(sourceFileInfo: SourceFileInfo, markSet: Set<string>, forceRebinding = false) {
+        const fileUri = sourceFileInfo.sourceFile.getUri();
+
+        // Don't mark it again if it's already been visited.
+        if (markSet.has(fileUri.key)) {
+            return;
+        }
+
+        sourceFileInfo.sourceFile.markReanalysisRequired(forceRebinding);
+        markSet.add(fileUri.key);
+
+        sourceFileInfo.importedBy.forEach((dep) => {
+            // Changes on chained source file can change symbols in the symbol table and
+            // dependencies on the dependent file. Force rebinding.
+            const forceRebinding = dep.chainedSourceFile === sourceFileInfo;
+            this._markFileDirtyRecursive(dep, markSet, forceRebinding);
+        });
+
+        // Change in the current file could impact checker result of chainedSourceFile such as unused symbols.
+        let reevaluationRequired = false;
+        let chainedSourceFile = sourceFileInfo.chainedSourceFile;
+        while (chainedSourceFile) {
+            if (chainedSourceFile.sourceFile.isCheckingRequired()) {
+                // If the file is marked for checking, its chained one should be marked
+                // as well. Stop here.
+                return;
+            }
+
+            reevaluationRequired = true;
+            chainedSourceFile.sourceFile.markReanalysisRequired(/* forceRebinding */ false);
+            chainedSourceFile = chainedSourceFile.chainedSourceFile;
+        }
+
+        // If the checker is going to run again, we have to recreate the type evaluator so
+        // that it actually reevaluates all the nodes (instead of using the cache).
+        // This is necessary because the original file change may not recreate the TypeEvaluator.
+        // For example, it might be a file delete.
+        if (reevaluationRequired) {
+            this._createNewEvaluator();
+        }
     }
 }

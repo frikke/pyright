@@ -3,7 +3,7 @@
  * Copyright (c) Microsoft Corporation.
  * Licensed under the MIT license.
  *
- * Helper methods relating to file based cancellation.
+ * Helper methods relating to file-based cancellation.
  */
 
 import * as fs from 'fs';
@@ -16,99 +16,34 @@ import {
     CancellationSenderStrategy,
     CancellationStrategy,
     CancellationToken,
-    Emitter,
-    Event,
 } from 'vscode-languageserver';
 
-import { CancellationProvider, getCancellationFolderName, setCancellationFolderName } from './cancellationUtils';
+import {
+    CancellationProvider,
+    FileBasedToken,
+    getCancellationFolderName,
+    setCancellationFolderName,
+} from './cancellationUtils';
+import { Uri } from './uri/uri';
+import { UriEx } from './uri/uriUtils';
 
-class CancellationThrottle {
-    private static _lastCheckTimestamp = 0;
-
-    static shouldCheck() {
-        // Throttle cancellation checks to one every 5ms. This value
-        // was selected through empirical testing. If we call the
-        // file system more often than this, type analysis performance
-        // is affected. If we call it less often, performance doesn't
-        // improve much, but responsiveness suffers.
-        const minTimeBetweenChecksInMs = 5;
-        const curTimestamp = Date.now().valueOf();
-        const timeSinceLastCheck = curTimestamp - this._lastCheckTimestamp;
-
-        if (timeSinceLastCheck >= minTimeBetweenChecksInMs) {
-            this._lastCheckTimestamp = curTimestamp;
-            return true;
-        }
-
-        return false;
-    }
-}
-
-class FileBasedToken implements CancellationToken {
-    protected isCancelled = false;
-    private _emitter: Emitter<any> | undefined;
-
-    constructor(readonly cancellationFilePath: string) {}
-
-    cancel() {
-        if (!this.isCancelled) {
-            this.isCancelled = true;
-            if (this._emitter) {
-                this._emitter.fire(undefined);
-                this._disposeEmitter();
-            }
-        }
-    }
-
-    get isCancellationRequested(): boolean {
-        if (this.isCancelled) {
-            return true;
-        }
-
-        if (CancellationThrottle.shouldCheck() && this._pipeExists()) {
-            // The first time it encounters the cancellation file, it will
-            // cancel itself and raise a cancellation event.
-            // In this mode, cancel() might not be called explicitly by
-            // jsonrpc layer.
-            this.cancel();
-        }
-
-        return this.isCancelled;
-    }
-
-    get onCancellationRequested(): Event<any> {
-        if (!this._emitter) {
-            this._emitter = new Emitter<any>();
-        }
-        return this._emitter.event;
-    }
-
-    dispose(): void {
-        this._disposeEmitter();
-    }
-
-    private _disposeEmitter() {
-        if (this._emitter) {
-            this._emitter.dispose();
-            this._emitter = undefined;
-        }
-    }
-
-    private _pipeExists(): boolean {
-        try {
-            fs.statSync(this.cancellationFilePath);
-            return true;
-        } catch (e: any) {
-            return false;
-        }
+class StatSyncFromFs {
+    statSync(uri: Uri) {
+        return fs.statSync(uri.getFilePath());
     }
 }
 
 class OwningFileToken extends FileBasedToken {
     private _disposed = false;
 
-    constructor(cancellationFilePath: string) {
-        super(cancellationFilePath);
+    constructor(cancellationId: string) {
+        super(cancellationId, new StatSyncFromFs());
+    }
+
+    override get isCancellationRequested(): boolean {
+        // Since this object owns the file and it gets created when the
+        // token is cancelled, there's no point in checking the pipe.
+        return this.isCancelled;
     }
 
     override cancel() {
@@ -116,12 +51,6 @@ class OwningFileToken extends FileBasedToken {
             this._createPipe();
             super.cancel();
         }
-    }
-
-    override get isCancellationRequested(): boolean {
-        // Since this object owns the file and it gets created when the
-        // token is cancelled, there's no point in checking the pipe.
-        return this.isCancelled;
     }
 
     override dispose(): void {
@@ -133,7 +62,7 @@ class OwningFileToken extends FileBasedToken {
 
     private _createPipe() {
         try {
-            fs.writeFileSync(this.cancellationFilePath, '', { flag: 'w' });
+            fs.writeFileSync(this.cancellationFilePath.getFilePath(), '', { flag: 'w' });
         } catch {
             // Ignore the exception.
         }
@@ -141,7 +70,7 @@ class OwningFileToken extends FileBasedToken {
 
     private _removePipe() {
         try {
-            fs.unlinkSync(this.cancellationFilePath);
+            fs.unlinkSync(this.cancellationFilePath.getFilePath());
         } catch {
             // Ignore the exception.
         }
@@ -150,14 +79,14 @@ class OwningFileToken extends FileBasedToken {
 
 class FileBasedCancellationTokenSource implements AbstractCancellationTokenSource {
     private _token: CancellationToken | undefined;
-    constructor(private _cancellationFilePath: string, private _ownFile: boolean = false) {}
+    constructor(private _cancellationId: string, private _ownFile: boolean = false) {}
 
     get token(): CancellationToken {
         if (!this._token) {
             // Be lazy and create the token only when actually needed.
             this._token = this._ownFile
-                ? new OwningFileToken(this._cancellationFilePath)
-                : new FileBasedToken(this._cancellationFilePath);
+                ? new OwningFileToken(this._cancellationId)
+                : new FileBasedToken(this._cancellationId, new StatSyncFromFs());
         }
         return this._token;
     }
@@ -168,6 +97,9 @@ class FileBasedCancellationTokenSource implements AbstractCancellationTokenSourc
             // cancelled token when cancellation happens
             // before someone asks for the token.
             this._token = CancellationToken.Cancelled;
+        } else if (this._token.isCancellationRequested) {
+            // Already cancelled.
+            return;
         } else {
             (this._token as FileBasedToken).cancel();
         }
@@ -188,15 +120,18 @@ function getCancellationFolderPath(folderName: string) {
     return path.join(os.tmpdir(), 'python-languageserver-cancellation', folderName);
 }
 
-function getCancellationFilePath(folderName: string, id: CancellationId) {
-    return path.join(getCancellationFolderPath(folderName), `cancellation-${String(id)}.tmp`);
+function getCancellationFileUri(folderName: string, id: CancellationId): string {
+    return UriEx.file(path.join(getCancellationFolderPath(folderName), `cancellation-${String(id)}.tmp`)).toString();
 }
 
-class FileCancellationReceiverStrategy implements CancellationReceiverStrategy {
+// See this issue for why the implements is commented out:
+// https://github.com/microsoft/vscode-languageserver-node/issues/1425
+class FileCancellationReceiverStrategy {
+    // implements IdCancellationReceiverStrategy {
     constructor(readonly folderName: string) {}
 
     createCancellationTokenSource(id: CancellationId): AbstractCancellationTokenSource {
-        return new FileBasedCancellationTokenSource(getCancellationFilePath(this.folderName, id));
+        return new FileBasedCancellationTokenSource(getCancellationFileUri(this.folderName, id));
     }
 }
 
@@ -245,11 +180,7 @@ export function getCancellationTokenFromId(cancellationId: string) {
         return CancellationToken.None;
     }
 
-    return new FileBasedToken(cancellationId);
-}
-
-export function getCancellationTokenId(token: CancellationToken) {
-    return token instanceof FileBasedToken ? token.cancellationFilePath : undefined;
+    return new FileBasedToken(cancellationId, new StatSyncFromFs());
 }
 
 let cancellationSourceId = 0;
@@ -267,7 +198,7 @@ export class FileBasedCancellationProvider implements CancellationProvider {
         }
 
         return new FileBasedCancellationTokenSource(
-            getCancellationFilePath(folderName, `${this._prefix}-${String(cancellationSourceId++)}`),
+            getCancellationFileUri(folderName, `${this._prefix}-${String(cancellationSourceId++)}`),
             /* ownFile */ true
         );
     }

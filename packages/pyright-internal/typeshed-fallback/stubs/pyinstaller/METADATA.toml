@@ -1,5 +1,2 @@
-version = "5.6.*"
-requires = ["types-setuptools"]
-
-[tool.stubtest]
-ignore_missing_stub = false
+version = "6.11.*"
+upstream_repository = "https://github.com/pyinstaller/pyinstaller"

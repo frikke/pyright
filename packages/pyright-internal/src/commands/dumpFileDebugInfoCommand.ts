@@ -14,24 +14,25 @@ import { TypeEvaluator } from '../analyzer/typeEvaluatorTypes';
 import {
     ClassType,
     ClassTypeFlags,
+    FunctionParam,
     FunctionType,
     FunctionTypeFlags,
-    ParamSpecEntry,
     TypeBase,
     TypeCategory,
     TypeFlags,
-    TypeVarDetails,
+    TypeVarDetailsShared,
     TypeVarType,
     Variance,
 } from '../analyzer/types';
 import { throwIfCancellationRequested } from '../common/cancellationUtils';
 import { isNumber, isString } from '../common/core';
-import { convertOffsetsToRange, convertOffsetToPosition } from '../common/positionUtils';
+import { LanguageServerInterface } from '../common/languageServerInterface';
+import { convertOffsetToPosition, convertOffsetsToRange } from '../common/positionUtils';
 import { TextRange } from '../common/textRange';
 import { TextRangeCollection } from '../common/textRangeCollection';
-import { LanguageServerInterface } from '../languageServerBase';
+import { Uri } from '../common/uri/uri';
 import {
-    ArgumentCategory,
+    ArgCategory,
     ArgumentNode,
     AssertNode,
     AssignmentExpressionNode,
@@ -41,7 +42,11 @@ import {
     BinaryOperationNode,
     BreakNode,
     CallNode,
+    CaseNode,
     ClassNode,
+    ComprehensionForNode,
+    ComprehensionIfNode,
+    ComprehensionNode,
     ConstantNode,
     ContinueNode,
     DecoratorNode,
@@ -54,8 +59,8 @@ import {
     ErrorNode,
     ExceptNode,
     ExpressionNode,
-    FormatStringNode,
     ForNode,
+    FormatStringNode,
     FunctionAnnotationNode,
     FunctionNode,
     GlobalNode,
@@ -65,23 +70,30 @@ import {
     ImportFromNode,
     ImportNode,
     IndexNode,
-    isExpressionNode,
     LambdaNode,
-    ListComprehensionForNode,
-    ListComprehensionIfNode,
-    ListComprehensionNode,
     ListNode,
+    MatchNode,
     MemberAccessNode,
     ModuleNameNode,
     ModuleNode,
     NameNode,
     NonlocalNode,
     NumberNode,
-    ParameterCategory,
+    ParamCategory,
     ParameterNode,
     ParseNode,
     ParseNodeType,
     PassNode,
+    PatternAsNode,
+    PatternCaptureNode,
+    PatternClassArgumentNode,
+    PatternClassNode,
+    PatternLiteralNode,
+    PatternMappingExpandEntryNode,
+    PatternMappingKeyEntryNode,
+    PatternMappingNode,
+    PatternSequenceNode,
+    PatternValueNode,
     RaiseNode,
     ReturnNode,
     SetNode,
@@ -93,7 +105,11 @@ import {
     TernaryNode,
     TryNode,
     TupleNode,
+    TypeAliasNode,
     TypeAnnotationNode,
+    TypeParamKind,
+    TypeParameterListNode,
+    TypeParameterNode,
     UnaryOperationNode,
     UnpackNode,
     WhileNode,
@@ -101,9 +117,11 @@ import {
     WithNode,
     YieldFromNode,
     YieldNode,
+    isExpressionNode,
 } from '../parser/parseNodes';
-import { ParseResults } from '../parser/parser';
+import { ParseFileResults } from '../parser/parser';
 import { KeywordType, NewLineType, OperatorType, StringTokenFlags, Token, TokenType } from '../parser/tokenizerTypes';
+import { Workspace } from '../workspaceFactory';
 import { ServerCommand } from './commandController';
 
 export class DumpFileDebugInfoCommand implements ServerCommand {
@@ -116,102 +134,112 @@ export class DumpFileDebugInfoCommand implements ServerCommand {
             return [];
         }
 
-        const filePath = params.arguments[0] as string;
-        const kind = params.arguments[1];
+        const fileUri = Uri.parse(params.arguments[0] as string, this._ls.serviceProvider);
+        const workspace = await this._ls.getWorkspaceForFile(fileUri);
 
-        const workspace = await this._ls.getWorkspaceForFile(filePath);
-        const parseResults = workspace.serviceInstance.getParseResult(filePath);
-        if (!parseResults) {
-            return [];
-        }
+        return new DumpFileDebugInfo().dump(workspace, fileUri, params.arguments, token);
+    }
+}
 
-        const output: string[] = [];
-        const collectingConsole = {
-            info: (m: string) => {
-                output.push(m);
-            },
-            log: (m: string) => {
-                output.push(m);
-            },
-            error: (m: string) => {
-                output.push(m);
-            },
-            warn: (m: string) => {
-                output.push(m);
-            },
-        };
+export class DumpFileDebugInfo {
+    dump(workspace: Workspace, fileUri: Uri, args: any[], token: CancellationToken) {
+        return workspace.service.run((p) => {
+            const kind = args[1];
 
-        collectingConsole.info(`* Dump debug info for '${filePath}'`);
+            const parseResults = workspace.service.getParseResults(workspace.service.fs.realCasePath(fileUri));
+            if (!parseResults) {
+                return [];
+            }
 
-        switch (kind) {
-            case 'tokens': {
-                collectingConsole.info(`* Token info (${parseResults.tokenizerOutput.tokens.count} tokens)`);
+            const output: string[] = [];
+            const collectingConsole = {
+                info: (m: string) => {
+                    output.push(m);
+                },
+                log: (m: string) => {
+                    output.push(m);
+                },
+                error: (m: string) => {
+                    output.push(m);
+                },
+                warn: (m: string) => {
+                    output.push(m);
+                },
+            };
 
-                for (let i = 0; i < parseResults.tokenizerOutput.tokens.count; i++) {
-                    const token = parseResults.tokenizerOutput.tokens.getItemAt(i);
+            collectingConsole.info(`* Dump debug info for '${fileUri.toUserVisibleString()}'`);
+
+            switch (kind) {
+                case 'tokens': {
+                    collectingConsole.info(`* Token info (${parseResults.tokenizerOutput.tokens.count} tokens)`);
+
+                    for (let i = 0; i < parseResults.tokenizerOutput.tokens.count; i++) {
+                        const token = parseResults.tokenizerOutput.tokens.getItemAt(i);
+                        collectingConsole.info(
+                            `[${i}] ${getTokenString(fileUri, token, parseResults.tokenizerOutput.lines)}`
+                        );
+                    }
+                    break;
+                }
+                case 'nodes': {
+                    collectingConsole.info(`* Node info`);
+
+                    const dumper = new TreeDumper(fileUri, parseResults.tokenizerOutput.lines);
+                    dumper.walk(parseResults.parserOutput.parseTree);
+
+                    collectingConsole.info(dumper.output);
+                    break;
+                }
+                case 'types': {
+                    const evaluator = p.evaluator;
+                    const start = args[2] as number;
+                    const end = args[3] as number;
+                    if (!evaluator || !start || !end) {
+                        return [];
+                    }
+
+                    collectingConsole.info(`* Type info`);
+                    collectingConsole.info(`${getTypeEvaluatorString(fileUri, evaluator, parseResults, start, end)}`);
+                    break;
+                }
+                case 'cachedtypes': {
+                    const evaluator = p.evaluator;
+                    const start = args[2] as number;
+                    const end = args[3] as number;
+                    if (!evaluator || !start || !end) {
+                        return [];
+                    }
+
+                    collectingConsole.info(`* Cached Type info`);
                     collectingConsole.info(
-                        `[${i}] ${getTokenString(filePath, token, parseResults.tokenizerOutput.lines)}`
+                        `${getTypeEvaluatorString(fileUri, evaluator, parseResults, start, end, true)}`
                     );
-                }
-                break;
-            }
-            case 'nodes': {
-                collectingConsole.info(`* Node info`);
-
-                const dumper = new TreeDumper(filePath, parseResults.tokenizerOutput.lines);
-                dumper.walk(parseResults.parseTree);
-
-                collectingConsole.info(dumper.output);
-                break;
-            }
-            case 'types': {
-                const evaluator = workspace.serviceInstance.getEvaluator();
-                const start = params.arguments[2] as number;
-                const end = params.arguments[3] as number;
-                if (!evaluator || !start || !end) {
-                    return [];
+                    break;
                 }
 
-                collectingConsole.info(`* Type info`);
-                collectingConsole.info(`${getTypeEvaluatorString(filePath, evaluator, parseResults, start, end)}`);
-                break;
-            }
-            case 'cachedtypes': {
-                const evaluator = workspace.serviceInstance.getEvaluator();
-                const start = params.arguments[2] as number;
-                const end = params.arguments[3] as number;
-                if (!evaluator || !start || !end) {
-                    return [];
+                case 'codeflowgraph': {
+                    const evaluator = p.evaluator;
+                    const offset = args[2] as number;
+                    if (!evaluator || offset === undefined) {
+                        return [];
+                    }
+                    const node = findNodeByOffset(parseResults.parserOutput.parseTree, offset);
+                    if (!node) {
+                        return [];
+                    }
+                    const flowNode = getFlowNode(node);
+                    if (!flowNode) {
+                        return [];
+                    }
+                    collectingConsole.info(`* CodeFlow Graph`);
+                    evaluator.printControlFlowGraph(flowNode, undefined, 'Dump CodeFlowGraph', collectingConsole);
                 }
-
-                collectingConsole.info(`* Cached Type info`);
-                collectingConsole.info(
-                    `${getTypeEvaluatorString(filePath, evaluator, parseResults, start, end, true)}`
-                );
-                break;
             }
 
-            case 'codeflowgraph': {
-                const evaluator = workspace.serviceInstance.getEvaluator();
-                const offset = params.arguments[2] as number;
-                if (!evaluator || offset === undefined) {
-                    return [];
-                }
-                const node = findNodeByOffset(parseResults.parseTree, offset);
-                if (!node) {
-                    return [];
-                }
-                const flowNode = getFlowNode(node);
-                if (!flowNode) {
-                    return [];
-                }
-                collectingConsole.info(`* CodeFlow Graph`);
-                evaluator.printControlFlowGraph(flowNode, undefined, 'Dump CodeFlowGraph', collectingConsole);
-            }
-        }
-
-        // Print all of the output in one message so the trace log is smaller.
-        this._ls.console.info(output.join('\n'));
+            // Print all of the output in one message so the trace log is smaller.
+            workspace.service.serviceProvider.console().info(output.join('\n'));
+            return [];
+        }, token);
     }
 }
 
@@ -223,15 +251,17 @@ function stringify(value: any, replacer: (this: any, key: string, value: any) =>
 }
 
 function getTypeEvaluatorString(
-    file: string,
+    uri: Uri,
     evaluator: TypeEvaluator,
-    results: ParseResults,
+    results: ParseFileResults,
     start: number,
     end: number,
     cacheOnly?: boolean
 ) {
-    const dumper = new TreeDumper(file, results.tokenizerOutput.lines);
-    const node = findNodeByOffset(results.parseTree, start) ?? findNodeByOffset(results.parseTree, end);
+    const dumper = new TreeDumper(uri, results.tokenizerOutput.lines);
+    const node =
+        findNodeByOffset(results.parserOutput.parseTree, start) ??
+        findNodeByOffset(results.parserOutput.parseTree, end);
     if (!node) {
         return 'N/A';
     }
@@ -242,7 +272,7 @@ function getTypeEvaluatorString(
         switch (node.parent?.nodeType) {
             case ParseNodeType.Class: {
                 const result = cacheOnly
-                    ? evaluator.getCachedType(node.parent.name)
+                    ? evaluator.getCachedType(node.parent.d.name)
                     : evaluator.getTypeOfClass(node.parent as ClassNode);
                 if (!result) {
                     return 'N/A';
@@ -252,7 +282,7 @@ function getTypeEvaluatorString(
             }
             case ParseNodeType.Function: {
                 const result = cacheOnly
-                    ? evaluator.getCachedType(node.parent.name)
+                    ? evaluator.getCachedType(node.parent.d.name)
                     : evaluator.getTypeOfFunction(node.parent as FunctionNode);
                 if (!result) {
                     return 'N/A';
@@ -307,15 +337,15 @@ function getTypeEvaluatorString(
         if (!isNumber(value) && !isString(value)) {
             if (set.has(value)) {
                 if (isClassType(value)) {
-                    return `<cycle> class '${value.details.fullName}' typeSourceId:${value.details.typeSourceId}`;
+                    return `<cycle> class '${value.shared.fullName}' typeSourceId:${value.shared.typeSourceId}`;
                 }
 
                 if (isFunctionType(value)) {
-                    return `<cycle> function '${value.details.fullName}' parameter count:${value.details.parameters.length}`;
+                    return `<cycle> function '${value.shared.fullName}' parameter count:${value.shared.parameters.length}`;
                 }
 
                 if (isTypeVarType(value)) {
-                    return `<cycle> function '${value.details.name}' scope id:${value.nameWithScope}`;
+                    return `<cycle> function '${value.shared.name}' scope id:${value.priv.nameWithScope}`;
                 }
 
                 return undefined;
@@ -344,7 +374,7 @@ function getTypeEvaluatorString(
             return getVarianceString(value);
         }
 
-        if (isParamSpecEntry(this) && key === 'category') {
+        if (isParameter(this) && key === 'category') {
             return getParameterCategoryString(value);
         }
 
@@ -387,11 +417,11 @@ function getTypeEvaluatorString(
         return isTypeBase(type) && type.details && isTypeVarDetails(type.details);
     }
 
-    function isTypeVarDetails(type: any): type is TypeVarDetails {
+    function isTypeVarDetails(type: any): type is TypeVarDetailsShared {
         return type.name !== undefined && type.constraints && type.variance !== undefined;
     }
 
-    function isParamSpecEntry(type: any): type is ParamSpecEntry {
+    function isParameter(type: any): type is FunctionParam {
         return type.category && type.type;
     }
 }
@@ -438,13 +468,11 @@ const FunctionTypeFlagsToString: [FunctionTypeFlags, string][] = [
     [FunctionTypeFlags.ParamSpecValue, 'ParamSpecValue'],
     [FunctionTypeFlags.PartiallyEvaluated, 'PartiallyEvaluated'],
     [FunctionTypeFlags.PyTypedDefinition, 'PyTypedDefinition'],
-    [FunctionTypeFlags.SkipArgsKwargsCompatibilityCheck, 'SkipArgsKwargsCompatibilityCheck'],
-    [FunctionTypeFlags.SkipConstructorCheck, 'SkipConstructorCheck'],
+    [FunctionTypeFlags.GradualCallableForm, 'SkipArgsKwargsCompatibilityCheck'],
     [FunctionTypeFlags.StaticMethod, 'StaticMethod'],
     [FunctionTypeFlags.StubDefinition, 'StubDefinition'],
     [FunctionTypeFlags.SynthesizedMethod, 'SynthesizedMethod'],
     [FunctionTypeFlags.UnannotatedParams, 'UnannotatedParams'],
-    [FunctionTypeFlags.WrapReturnTypeInAwait, 'WrapReturnTypeInAwait'],
 ];
 
 function getFunctionTypeFlagsString(flags: FunctionTypeFlags) {
@@ -452,29 +480,20 @@ function getFunctionTypeFlagsString(flags: FunctionTypeFlags) {
 }
 
 const ClassTypeFlagsToString: [ClassTypeFlags, string][] = [
-    [ClassTypeFlags.BuiltInClass, 'BuiltInClass'],
+    [ClassTypeFlags.BuiltIn, 'BuiltIn'],
     [ClassTypeFlags.CanOmitDictValues, 'CanOmitDictValues'],
     [ClassTypeFlags.ClassProperty, 'ClassProperty'],
-    [ClassTypeFlags.DataClass, 'DataClass'],
-    [ClassTypeFlags.DataClassKeywordOnlyParams, 'DataClassKeywordOnlyParams'],
     [ClassTypeFlags.DefinedInStub, 'DefinedInStub'],
     [ClassTypeFlags.EnumClass, 'EnumClass'],
     [ClassTypeFlags.Final, 'Final'],
-    [ClassTypeFlags.FrozenDataClass, 'FrozenDataClass'],
-    [ClassTypeFlags.GenerateDataClassSlots, 'GenerateDataClassSlots'],
     [ClassTypeFlags.HasCustomClassGetItem, 'HasCustomClassGetItem'],
     [ClassTypeFlags.PartiallyEvaluated, 'PartiallyEvaluated'],
     [ClassTypeFlags.PropertyClass, 'PropertyClass'],
     [ClassTypeFlags.ProtocolClass, 'ProtocolClass'],
     [ClassTypeFlags.PseudoGenericClass, 'PseudoGenericClass'],
-    [ClassTypeFlags.ReadOnlyInstanceVariables, 'ReadOnlyInstanceVariables'],
     [ClassTypeFlags.RuntimeCheckable, 'RuntimeCheckable'],
-    [ClassTypeFlags.SkipSynthesizedDataClassEq, 'SkipSynthesizedDataClassEq'],
-    [ClassTypeFlags.SkipSynthesizedDataClassInit, 'SkipSynthesizedDataClassInit'],
     [ClassTypeFlags.SpecialBuiltIn, 'SpecialBuiltIn'],
     [ClassTypeFlags.SupportsAbstractMethods, 'SupportsAbstractMethods'],
-    [ClassTypeFlags.SynthesizeDataClassUnsafeHash, 'SynthesizeDataClassUnsafeHash'],
-    [ClassTypeFlags.SynthesizedDataClassOrder, 'SynthesizedDataClassOrder'],
     [ClassTypeFlags.TupleClass, 'TupleClass'],
     [ClassTypeFlags.TypedDictClass, 'TypedDictClass'],
     [ClassTypeFlags.TypingExtensionClass, 'TypingExtensionClass'],
@@ -508,14 +527,12 @@ function getTypeCategoryString(typeCategory: TypeCategory, type: any) {
             return 'Unknown';
         case TypeCategory.Any:
             return 'Any';
-        case TypeCategory.None:
-            return 'None';
         case TypeCategory.Never:
             return 'Never';
         case TypeCategory.Function:
             return 'Function';
-        case TypeCategory.OverloadedFunction:
-            return 'OverloadedFunction';
+        case TypeCategory.Overloaded:
+            return 'Overloaded';
         case TypeCategory.Class:
             if (TypeBase.isInstantiable(type)) {
                 return 'Class';
@@ -537,7 +554,7 @@ class TreeDumper extends ParseTreeWalker {
     private _indentation = '';
     private _output = '';
 
-    constructor(private _file: string, private _lines: TextRangeCollection<TextRange>) {
+    constructor(private _uri: Uri, private _lines: TextRangeCollection<TextRange>) {
         super();
     }
 
@@ -554,25 +571,13 @@ class TreeDumper extends ParseTreeWalker {
         }
     }
 
-    private _log(value: string) {
-        this._output += `${this._indentation}${value}\r\n`;
-    }
-
-    private _getPrefix(node: ParseNode) {
-        const pos = convertOffsetToPosition(node.start, this._lines);
-        // VS code's output window expects 1 based values, print the line/char with 1 based.
-        return `[${node.id}] '${this._file}:${pos.line + 1}:${pos.character + 1}' => ${printParseNodeType(
-            node.nodeType
-        )} ${getTextSpanString(node, this._lines)} =>`;
-    }
-
     reset() {
         this._indentation = '';
         this._output = '';
     }
 
     override visitArgument(node: ArgumentNode) {
-        this._log(`${this._getPrefix(node)} ${getArgumentCategoryString(node.argumentCategory)}`);
+        this._log(`${this._getPrefix(node)} ${getArgCategoryString(node.d.argCategory)}`);
         return true;
     }
 
@@ -592,7 +597,7 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitAugmentedAssignment(node: AugmentedAssignmentNode) {
-        this._log(`${this._getPrefix(node)} ${getOperatorTypeString(node.operator)}`);
+        this._log(`${this._getPrefix(node)} ${getOperatorTypeString(node.d.operator)}`);
         return true;
     }
 
@@ -604,10 +609,10 @@ class TreeDumper extends ParseTreeWalker {
     override visitBinaryOperation(node: BinaryOperationNode) {
         this._log(
             `${this._getPrefix(node)} ${getTokenString(
-                this._file,
-                node.operatorToken,
+                this._uri,
+                node.d.operatorToken,
                 this._lines
-            )} ${getOperatorTypeString(node.operator)}} parenthesized:(${node.parenthesized})`
+            )} ${getOperatorTypeString(node.d.operator)}} parenthesized:(${node.d.hasParens})`
         );
         return true;
     }
@@ -627,7 +632,17 @@ class TreeDumper extends ParseTreeWalker {
         return true;
     }
 
-    override visitTernary(node: TernaryNode) {
+    override visitComprehension(node: ComprehensionNode) {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitComprehensionFor(node: ComprehensionForNode) {
+        this._log(`${this._getPrefix(node)} async:(${node.d.isAsync})`);
+        return true;
+    }
+
+    override visitComprehensionIf(node: ComprehensionIfNode) {
         this._log(`${this._getPrefix(node)}`);
         return true;
     }
@@ -638,7 +653,7 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitConstant(node: ConstantNode) {
-        this._log(`${this._getPrefix(node)} ${getKeywordTypeString(node.constType)}`);
+        this._log(`${this._getPrefix(node)} ${getKeywordTypeString(node.d.constType)}`);
         return true;
     }
 
@@ -668,7 +683,7 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitError(node: ErrorNode) {
-        this._log(`${this._getPrefix(node)} ${getErrorExpressionCategoryString(node.category)}`);
+        this._log(`${this._getPrefix(node)} ${getErrorExpressionCategoryString(node.d.category)}`);
         return true;
     }
 
@@ -694,11 +709,11 @@ class TreeDumper extends ParseTreeWalker {
 
     override visitImportFrom(node: ImportFromNode) {
         this._log(
-            `${this._getPrefix(node)} wildcard import:(${node.isWildcardImport}) paren:(${
-                node.usesParens
+            `${this._getPrefix(node)} wildcard import:(${node.d.isWildcardImport}) paren:(${
+                node.d.usesParens
             }) wildcard token:(${
-                node.wildcardToken ? getTokenString(this._file, node.wildcardToken, this._lines) : 'N/A'
-            }) missing import keyword:(${node.missingImportKeyword})`
+                node.d.wildcardToken ? getTokenString(this._uri, node.d.wildcardToken, this._lines) : 'N/A'
+            }) missing import keyword:(${node.d.missingImport})`
         );
         return true;
     }
@@ -719,26 +734,22 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitFor(node: ForNode) {
-        this._log(`${this._getPrefix(node)} async:(${node.isAsync})`);
+        this._log(`${this._getPrefix(node)} async:(${node.d.isAsync})`);
         return true;
     }
 
     override visitFormatString(node: FormatStringNode) {
-        this._log(
-            `${this._getPrefix(node)} ${getTokenString(this._file, node.token, this._lines)} ${
-                node.value
-            } unescape errors:(${node.hasUnescapeErrors})`
-        );
+        this._log(`${this._getPrefix(node)} f-string`);
         return true;
     }
 
     override visitFunction(node: FunctionNode) {
-        this._log(`${this._getPrefix(node)} async:(${node.isAsync})`);
+        this._log(`${this._getPrefix(node)} async:(${node.d.isAsync})`);
         return true;
     }
 
     override visitFunctionAnnotation(node: FunctionAnnotationNode) {
-        this._log(`${this._getPrefix(node)} ellipsis:(${node.isParamListEllipsis})`);
+        this._log(`${this._getPrefix(node)} ellipsis:(${node.d.isEllipsis})`);
         return true;
     }
 
@@ -757,21 +768,6 @@ class TreeDumper extends ParseTreeWalker {
         return true;
     }
 
-    override visitListComprehension(node: ListComprehensionNode) {
-        this._log(`${this._getPrefix(node)}`);
-        return true;
-    }
-
-    override visitListComprehensionFor(node: ListComprehensionForNode) {
-        this._log(`${this._getPrefix(node)} async:(${node.isAsync})`);
-        return true;
-    }
-
-    override visitListComprehensionIf(node: ListComprehensionIfNode) {
-        this._log(`${this._getPrefix(node)}`);
-        return true;
-    }
-
     override visitMemberAccess(node: MemberAccessNode) {
         this._log(`${this._getPrefix(node)}`);
         return true;
@@ -783,12 +779,14 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitModuleName(node: ModuleNameNode) {
-        this._log(`${this._getPrefix(node)} leading dots:(${node.leadingDots}) trailing dot:(${node.hasTrailingDot})`);
+        this._log(
+            `${this._getPrefix(node)} leading dots:(${node.d.leadingDots}) trailing dot:(${node.d.hasTrailingDot})`
+        );
         return true;
     }
 
     override visitName(node: NameNode) {
-        this._log(`${this._getPrefix(node)} ${getTokenString(this._file, node.token, this._lines)} ${node.value}`);
+        this._log(`${this._getPrefix(node)} ${getTokenString(this._uri, node.d.token, this._lines)} ${node.d.value}`);
         return true;
     }
 
@@ -798,12 +796,14 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitNumber(node: NumberNode) {
-        this._log(`${this._getPrefix(node)} ${node.value} int:(${node.isInteger}) imaginary:(${node.isImaginary})`);
+        this._log(
+            `${this._getPrefix(node)} ${node.d.value} int:(${node.d.isInteger}) imaginary:(${node.d.isImaginary})`
+        );
         return true;
     }
 
     override visitParameter(node: ParameterNode) {
-        this._log(`${this._getPrefix(node)} ${getParameterCategoryString(node.category)}`);
+        this._log(`${this._getPrefix(node)} ${getParameterCategoryString(node.d.category)}`);
         return true;
     }
 
@@ -838,11 +838,7 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitString(node: StringNode) {
-        this._log(
-            `${this._getPrefix(node)} ${getTokenString(this._file, node.token, this._lines)} ${
-                node.value
-            } unescape errors:(${node.hasUnescapeErrors})`
-        );
+        this._log(`${this._getPrefix(node)} ${getTokenString(this._uri, node.d.token, this._lines)} ${node.d.value}`);
         return true;
     }
 
@@ -856,8 +852,13 @@ class TreeDumper extends ParseTreeWalker {
         return true;
     }
 
+    override visitTernary(node: TernaryNode) {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
     override visitTuple(node: TupleNode) {
-        this._log(`${this._getPrefix(node)} paren:(${node.enclosedInParens})`);
+        this._log(`${this._getPrefix(node)} paren:(${node.d.hasParens})`);
         return true;
     }
 
@@ -874,10 +875,10 @@ class TreeDumper extends ParseTreeWalker {
     override visitUnaryOperation(node: UnaryOperationNode) {
         this._log(
             `${this._getPrefix(node)} ${getTokenString(
-                this._file,
-                node.operatorToken,
+                this._uri,
+                node.d.operatorToken,
                 this._lines
-            )} ${getOperatorTypeString(node.operator)}`
+            )} ${getOperatorTypeString(node.d.operator)}`
         );
         return true;
     }
@@ -893,7 +894,7 @@ class TreeDumper extends ParseTreeWalker {
     }
 
     override visitWith(node: WithNode) {
-        this._log(`${this._getPrefix(node)} async:(${node.isAsync})`);
+        this._log(`${this._getPrefix(node)} async:(${node.d.isAsync})`);
         return true;
     }
 
@@ -911,26 +912,124 @@ class TreeDumper extends ParseTreeWalker {
         this._log(`${this._getPrefix(node)}`);
         return true;
     }
-}
 
-function getParameterCategoryString(type: ParameterCategory) {
-    switch (type) {
-        case ParameterCategory.Simple:
-            return 'Simple';
-        case ParameterCategory.VarArgList:
-            return 'VarArgList';
-        case ParameterCategory.VarArgDictionary:
-            return 'VarArgDictionary';
+    override visitCase(node: CaseNode): boolean {
+        this._log(`${this._getPrefix(node)} isIrrefutable: ${node.d.isIrrefutable}`);
+        return true;
+    }
+
+    override visitMatch(node: MatchNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternAs(node: PatternAsNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternCapture(node: PatternCaptureNode): boolean {
+        this._log(`${this._getPrefix(node)} isStar:${node.d.isStar} isWildcard:${node.d.isWildcard}`);
+        return true;
+    }
+
+    override visitPatternClass(node: PatternClassNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternClassArgument(node: PatternClassArgumentNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternLiteral(node: PatternLiteralNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternMapping(node: PatternMappingNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternMappingExpandEntry(node: PatternMappingExpandEntryNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternMappingKeyEntry(node: PatternMappingKeyEntryNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitPatternSequence(node: PatternSequenceNode): boolean {
+        this._log(`${this._getPrefix(node)} starEntryIndex: ${node.d.starEntryIndex}`);
+        return true;
+    }
+
+    override visitPatternValue(node: PatternValueNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitTypeAlias(node: TypeAliasNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    override visitTypeParameter(node: TypeParameterNode): boolean {
+        this._log(`${this._getPrefix(node)} typeParamCategory:${getTypeParameterCategoryString(node.d.typeParamKind)}`);
+        return true;
+    }
+
+    override visitTypeParameterList(node: TypeParameterListNode): boolean {
+        this._log(`${this._getPrefix(node)}`);
+        return true;
+    }
+
+    private _log(value: string) {
+        this._output += `${this._indentation}${value}\r\n`;
+    }
+
+    private _getPrefix(node: ParseNode) {
+        const pos = convertOffsetToPosition(node.start, this._lines);
+        // VS code's output window expects 1 based values, print the line/char with 1 based.
+        return `[${node.id}] '${this._uri.toString()}:${pos.line + 1}:${pos.character + 1}' => ${printParseNodeType(
+            node.nodeType
+        )} ${getTextSpanString(node, this._lines)} =>`;
     }
 }
 
-function getArgumentCategoryString(type: ArgumentCategory) {
+function getTypeParameterCategoryString(type: TypeParamKind) {
     switch (type) {
-        case ArgumentCategory.Simple:
+        case TypeParamKind.TypeVar:
+            return 'TypeVar';
+        case TypeParamKind.TypeVarTuple:
+            return 'TypeVarTuple';
+        case TypeParamKind.ParamSpec:
+            return 'ParamSpec';
+    }
+}
+
+function getParameterCategoryString(type: ParamCategory) {
+    switch (type) {
+        case ParamCategory.Simple:
             return 'Simple';
-        case ArgumentCategory.UnpackedList:
+        case ParamCategory.ArgsList:
+            return 'ArgsList';
+        case ParamCategory.KwargsDict:
+            return 'KwargsDict';
+    }
+}
+
+function getArgCategoryString(type: ArgCategory) {
+    switch (type) {
+        case ArgCategory.Simple:
+            return 'Simple';
+        case ArgCategory.UnpackedList:
             return 'UnpackedList';
-        case ArgumentCategory.UnpackedDictionary:
+        case ArgCategory.UnpackedDictionary:
             return 'UnpackedDictionary';
         default:
             return `Unknown Value!! (${type})`;
@@ -961,14 +1060,22 @@ function getErrorExpressionCategoryString(type: ErrorExpressionCategory) {
             return 'MissingListCloseBracket';
         case ErrorExpressionCategory.MissingFunctionParameterList:
             return 'MissingFunctionParameterList';
+        case ErrorExpressionCategory.MissingPattern:
+            return 'MissingPattern';
+        case ErrorExpressionCategory.MissingPatternSubject:
+            return 'MissingPatternSubject';
+        case ErrorExpressionCategory.MissingDictValue:
+            return 'MissingDictValue';
+        case ErrorExpressionCategory.MaxDepthExceeded:
+            return 'MaxDepthExceeded';
         default:
             return `Unknown Value!! (${type})`;
     }
 }
 
-function getTokenString(file: string, token: Token, lines: TextRangeCollection<TextRange>) {
+function getTokenString(uri: Uri, token: Token, lines: TextRangeCollection<TextRange>) {
     const pos = convertOffsetToPosition(token.start, lines);
-    let str = `'${file}:${pos.line + 1}:${pos.character + 1}' (`;
+    let str = `'${uri.toUserVisibleString()}:${pos.line + 1}:${pos.character + 1}' (`;
     str += getTokenTypeString(token.type);
     str += getNewLineInfo(token);
     str += getOperatorInfo(token);
@@ -1245,7 +1352,6 @@ function getKeywordTypeString(type: KeywordType) {
 const StringTokenFlagsStrings: [StringTokenFlags, string][] = [
     [StringTokenFlags.Bytes, 'Bytes'],
     [StringTokenFlags.DoubleQuote, 'DoubleQuote'],
-    [StringTokenFlags.ExceedsMaxSize, 'ExceedsMaxSize'],
     [StringTokenFlags.Format, 'Format'],
     [StringTokenFlags.Raw, 'Raw'],
     [StringTokenFlags.SingleQuote, 'SingleQuote'],

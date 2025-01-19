@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: test.py
 //// class Something:
@@ -10,5 +10,5 @@
 //// [|/*marker1*/Something|]()
 
 helper.verifyHover('markdown', {
-    marker1: '```python\n(class) Something(text: str)\n```\n---\nThis is a test.',
+    marker1: '```python\nclass Something(text: str)\n```\n---\nThis is a test.',
 });

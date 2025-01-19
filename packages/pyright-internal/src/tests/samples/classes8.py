@@ -4,8 +4,8 @@
 
 from os import DirEntry
 from types import TracebackType
-from typing import AnyStr, ContextManager, Iterator, Type
-from typing_extensions import Self
+from typing import AnyStr, ContextManager, Iterator
+from typing_extensions import Self  # pyright: ignore[reportMissingModuleSource]
 
 
 class _ScandirIterator(
@@ -25,7 +25,7 @@ class _ScandirIterator(
 
     def __exit__(
         self,
-        __exc_type: Type[BaseException] | None,
+        __exc_type: type[BaseException] | None,
         __exc_value: BaseException | None,
         __traceback: TracebackType | None,
     ) -> bool | None:
@@ -42,6 +42,6 @@ def thing(value: AnyStr):
             if isinstance(file.name, str):
                 if file.name.endswith(".xml"):
                     ...
-            else:
+            elif isinstance(file.name, bytes):
                 if file.name.endswith(b".xml"):
                     ...

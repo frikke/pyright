@@ -1,8 +1,9 @@
 # This sample tests the detection and reporting of unreachable code.
 
-from abc import abstractmethod
 import os
 import sys
+from abc import abstractmethod
+from typing import NoReturn
 
 
 def func1():
@@ -38,7 +39,7 @@ class Foo:
         print(self.b)
         raise RuntimeError()
 
-    def method5(self):
+    def method5(self) -> NoReturn:
         print(self.b)
         raise RuntimeError()
 
@@ -78,7 +79,7 @@ def func7(foo: Foo):
     return 3
 
 
-def func8():
+def func8() -> NoReturn:
     raise NameError()
 
 
@@ -93,20 +94,34 @@ def func10():
     e = OSError()
     a1 = os.name == "nt" and None == e.errno
     reveal_type(a1, expected_text="bool")
-  
+
     a2 = True and os.name == "nt"
     reveal_type(a2, expected_text="bool")
-              
+
     if os.name == "nt":
         # This should be marked unreachable.
-        b = e.errno                            
+        b = e.errno
 
     if sys.version_info >= (4, 0):
         # This should be marked unreachable.
         b = e.errno
-         
+
     return
     # This should be marked unreachable.
     b = e.errno
 
-    
+
+def func11(obj: str) -> list:
+    if isinstance(obj, str):
+        return []
+    else:
+        # This should be marked as unreachable.
+        return obj
+
+
+def func12(obj: str) -> list:
+    if isinstance(obj, str):
+        return []
+
+    # This should be marked as unreachable.
+    return obj

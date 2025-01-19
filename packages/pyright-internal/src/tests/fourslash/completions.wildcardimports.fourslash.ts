@@ -1,4 +1,9 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
+
+// @filename: pyrightconfig.json
+//// {
+////   "useLibraryCodeForTypes": true
+//// }
 
 // @filename: lib1/definition.py
 // @library: true
@@ -82,7 +87,7 @@ await helper.verifyCompletion('includes', 'markdown', {
             {
                 label: 'func2',
                 kind: Consts.CompletionItemKind.Method,
-                documentation: '```python\nfunc2() -> None\n```\n---\nfunc2 docs',
+                documentation: '```python\ndef func2() -> None\n```\n---\nfunc2 docs',
             },
         ],
     },

@@ -1,10 +1,11 @@
 # This sample tests the synthesized methods get, setdefault
-# pop, and __delitem__ for a TypedDict.
+# pop, __delitem__, clear, and popitem for a TypedDict.
 
-# pyright: strict
-
-from typing import Optional, TypedDict, Union, final
-from typing_extensions import NotRequired, Required
+from typing import TypedDict, final
+from typing_extensions import (  # pyright: ignore[reportMissingModuleSource]
+    NotRequired,
+    Required,
+)
 
 
 class TD1(TypedDict):
@@ -18,11 +19,11 @@ class TD2(TD1):
 td1: TD1 = {}
 td2: TD2 = {"foo": "hi"}
 
-v1: Optional[str] = td1.get("bar")
+v1: str | None = td1.get("bar")
 
 v2: str = td1.get("bar", "")
 
-v3: Union[str, int] = td1.get("bar", 3)
+v3: str | int = td1.get("bar", 3)
 
 v4: str = td1.setdefault("bar", "1")
 
@@ -36,37 +37,37 @@ td1.setdefault("bar")
 td1.setdefault("baz", "")
 
 v6: str = td1.pop("bar")
-v7: str = td1.pop("bar", "none")
-v8: Union[str, int] = td1.pop("bar", 3)
+v7: str | int = td1.pop("bar", 1)
+v8: str | int = td1.pop("bar", 3)
 
-# This should generate an error.
+# This should generate two errors.
 v9: str = td2.pop("foo")
 
 td1.__delitem__("bar")
 
 
 @final
-class A(TypedDict):
+class TD3(TypedDict):
     foo: int
     baz: NotRequired[int]
 
 
-class B(TypedDict):
+class TD4(TypedDict):
     bar: str
 
 
-C = Union[A, B]
+C = TD3 | TD4
 
 
-def test(a: A, b: B, c: C, s: str) -> Optional[int]:
+def func1(a: TD3, b: TD4, c: C, s: str) -> int | None:
     a1 = a.get("foo")
     reveal_type(a1, expected_text="int")
     a2 = a.get("foo", 1.0)
     reveal_type(a2, expected_text="int")
     a3 = a.get("bar")
-    reveal_type(a3, expected_text="None")
+    reveal_type(a3, expected_text="Any | None")
     a4 = a.get("bar", 1.0)
-    reveal_type(a4, expected_text="float")
+    reveal_type(a4, expected_text="Any | float")
     a5 = a.get("baz")
     reveal_type(a5, expected_text="int | None")
     a6 = a.get("baz", 1.0)
@@ -94,10 +95,26 @@ def test(a: A, b: B, c: C, s: str) -> Optional[int]:
     c2 = c.get("foo", 1.0)
     reveal_type(c2, expected_text="int | Any | float")
     c3 = c.get("bar")
-    reveal_type(c3, expected_text="str | None")
+    reveal_type(c3, expected_text="Any | str | None")
     c4 = c.get("bar", 1.0)
-    reveal_type(c4, expected_text="float | str")
+    reveal_type(c4, expected_text="Any | float | str")
     c5 = c.get("baz")
     reveal_type(c5, expected_text="int | Any | None")
     c6 = c.get("baz", 1.0)
     reveal_type(c6, expected_text="int | float | Any")
+
+
+class TD7(TypedDict, total=False):
+    a: dict[str, str]
+    b: list[str]
+
+
+def func2(td7: TD7):
+    v1 = td7.get("a", [])
+    reveal_type(v1, expected_text="dict[str, str] | list[Any]")
+
+    v2 = td7.get("a", {})
+    reveal_type(v2, expected_text="dict[str, str]")
+
+    v3 = td7.get("b", [])
+    reveal_type(v3, expected_text="list[str]")

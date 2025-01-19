@@ -1,7 +1,7 @@
 # This sample tests the handling of the dataclass_transform mechanism
 # when applied to a class.
 
-from typing import Any, Callable, Generic, Optional, Tuple, TypeVar, Union
+from typing import Any, Callable, Generic, TypeVar
 
 _T = TypeVar("_T")
 
@@ -12,20 +12,18 @@ def __dataclass_transform__(
     order_default: bool = False,
     kw_only_default: bool = False,
     frozen_default: bool = False,
-    field_specifiers: Tuple[Union[type, Callable[..., Any]], ...] = (()),
+    field_specifiers: tuple[type | Callable[..., Any], ...] = (()),
 ) -> Callable[[_T], _T]:
     return lambda a: a
 
 
 class ModelField:
-    def __init__(self, *, init: bool = True, default: Optional[Any] = None) -> None:
-        ...
+    def __init__(self, *, init: bool = True, default: Any | None = None) -> None: ...
 
 
 def model_field(
-    *, init: bool = True, default: Optional[Any] = None, alias: Optional[str] = None
-) -> Any:
-    ...
+    *, init: bool = True, default: Any | None = None, alias: str | None = None
+) -> Any: ...
 
 
 @__dataclass_transform__(
@@ -41,8 +39,7 @@ class ModelBase:
         frozen: bool = False,
         kw_only: bool = True,
         order: bool = True,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 class Customer1(ModelBase, frozen=True):
@@ -70,7 +67,6 @@ c1_1.id = 4
 # This should generate an error because the class is kw_only.
 c1_2 = Customer1(3, "Sue")
 
-# This should generate an error because other_name is missing.
 c1_3 = Customer1(id=3, name="John")
 
 # This should generate an error because comparison methods are
@@ -89,6 +85,7 @@ c2_3 = Customer2(0, "John")
 
 _T = TypeVar("_T")
 
+
 @__dataclass_transform__(
     kw_only_default=True,
     field_specifiers=(ModelField, model_field),
@@ -102,18 +99,20 @@ class GenericModelBase(Generic[_T]):
         frozen: bool = False,
         kw_only: bool = True,
         order: bool = True,
-    ) -> None:
-        ...
+    ) -> None: ...
 
 
 class GenericCustomer(GenericModelBase[int]):
     id: int = model_field()
 
+
 gc_1 = GenericCustomer(id=3)
+
 
 @__dataclass_transform__(frozen_default=True)
 class ModelBaseFrozen:
     not_a_field: str
+
 
 class Customer3(ModelBaseFrozen):
     id: int

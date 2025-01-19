@@ -1,4 +1,4 @@
-/// <reference path="fourslash.ts" />
+/// <reference path="typings/fourslash.d.ts" />
 
 // @filename: module1.py
 //// '''module1 docs'''
@@ -18,6 +18,6 @@
 //// print([|/*module1_docs*/module1|].[|/*func1_docs*/func1|]())
 
 helper.verifyHover('markdown', {
-    func1_docs: '```python\n(function) func1() -> bool\n```\n---\nfunc1 docs',
+    func1_docs: '```python\n(function) def func1() -> bool\n```\n---\nfunc1 docs',
     module1_docs: '```python\n(module) module1\n```\n---\nmodule1 docs',
 });

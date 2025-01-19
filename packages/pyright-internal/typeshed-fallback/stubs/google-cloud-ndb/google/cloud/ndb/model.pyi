@@ -1,8 +1,8 @@
 import datetime
-from _typeshed import Self
+from _typeshed import Unused
 from collections.abc import Callable, Iterable, Sequence
-from typing import Any, NoReturn
-from typing_extensions import Literal, TypeAlias
+from typing import Any, Literal, NoReturn
+from typing_extensions import Self, TypeAlias
 
 from google.cloud.ndb import exceptions, key as key_module, query as query_module, tasklets as tasklets_module
 
@@ -27,7 +27,7 @@ class _NotEqualMixin:
 _Direction: TypeAlias = Literal["asc", "desc"]
 
 class IndexProperty(_NotEqualMixin):
-    def __new__(cls: type[Self], name: str, direction: _Direction) -> Self: ...
+    def __new__(cls, name: str, direction: _Direction) -> Self: ...
     @property
     def name(self) -> str: ...
     @property
@@ -36,7 +36,7 @@ class IndexProperty(_NotEqualMixin):
     def __hash__(self) -> int: ...
 
 class Index(_NotEqualMixin):
-    def __new__(cls: type[Self], kind: str, properties: list[IndexProperty], ancestor: bool) -> Self: ...
+    def __new__(cls, kind: str, properties: list[IndexProperty], ancestor: bool) -> Self: ...
     @property
     def kind(self) -> str: ...
     @property
@@ -59,14 +59,14 @@ class IndexState(_NotEqualMixin):
 
 class ModelAdapter:
     # This actually returns NoReturn, but mypy can't handle that
-    def __new__(cls: type[Self], *args, **kwargs) -> Self: ...
+    def __new__(cls, *args, **kwargs) -> Self: ...
 
 def make_connection(*args, **kwargs) -> NoReturn: ...
 
 class ModelAttribute: ...
 
 class _BaseValue(_NotEqualMixin):
-    b_val: object = ...
+    b_val: object
     def __init__(self, b_val) -> None: ...
     def __eq__(self, other) -> bool: ...
     def __hash__(self) -> int: ...
@@ -78,7 +78,7 @@ class Property(ModelAttribute):
         indexed: bool | None = ...,
         repeated: bool | None = ...,
         required: bool | None = ...,
-        default: object | None = ...,
+        default: object = None,
         choices: Iterable[object] | None = ...,
         validator: Callable[[Property, Any], object] | None = ...,
         verbose_name: str | None = ...,
@@ -90,7 +90,12 @@ class Property(ModelAttribute):
     def __le__(self, value: object) -> query_module.FilterNode: ...
     def __gt__(self, value: object) -> query_module.FilterNode: ...
     def __ge__(self, value: object) -> query_module.FilterNode: ...
-    def IN(self, value: Iterable[object]) -> query_module.DisjunctionNode | query_module.FilterNode | query_module.FalseNode: ...
+    def IN(
+        self, value: Iterable[object], server_op: bool = False
+    ) -> query_module.DisjunctionNode | query_module.FilterNode | query_module.FalseNode: ...
+    def NOT_IN(
+        self, value: Iterable[object], server_op: bool = False
+    ) -> query_module.DisjunctionNode | query_module.FilterNode | query_module.FalseNode: ...
     def __neg__(self) -> query_module.PropertyOrder: ...
     def __pos__(self) -> query_module.PropertyOrder: ...
     def __set__(self, entity: Model, value: object) -> None: ...
@@ -110,7 +115,7 @@ class FloatProperty(Property):
     def __get__(self, entity: Model, unused_cls: type[Model] | None = ...) -> float | list[float] | None: ...
 
 class _CompressedValue(bytes):
-    z_val: bytes = ...
+    z_val: bytes
     def __init__(self, z_val: bytes) -> None: ...
     def __eq__(self, other: object) -> bool: ...
     def __hash__(self) -> NoReturn: ...
@@ -154,7 +159,7 @@ class JsonProperty(BlobProperty):
         indexed: bool | None = ...,
         repeated: bool | None = ...,
         required: bool | None = ...,
-        default: object | None = ...,
+        default: object = None,
         choices: Iterable[object] | None = ...,
         validator: Callable[[Property, Any], object] | None = ...,
         verbose_name: str | None = ...,
@@ -227,7 +232,7 @@ class TimeProperty(DateTimeProperty): ...
 class StructuredProperty(Property):
     def __init__(self, model_class: type, name: str | None = ..., **kwargs) -> None: ...
     def __getattr__(self, attrname: str): ...
-    def IN(self, value: Iterable[object]) -> query_module.DisjunctionNode | query_module.FalseNode: ...
+    def IN(self, value: Iterable[object]) -> query_module.DisjunctionNode | query_module.FalseNode: ...  # type: ignore[override]
 
 class LocalStructuredProperty(BlobProperty):
     def __init__(self, model_class: type[Model], **kwargs) -> None: ...
@@ -249,7 +254,7 @@ class MetaModel(type):
     def __init__(cls, name: str, bases, classdict) -> None: ...
 
 class Model(_NotEqualMixin, metaclass=MetaModel):
-    key: ModelKey = ...
+    key: ModelKey
     def __init__(_self, **kwargs) -> None: ...
     def __hash__(self) -> NoReturn: ...
     def __eq__(self, other: object) -> bool: ...
@@ -320,6 +325,7 @@ class Model(_NotEqualMixin, metaclass=MetaModel):
         max_memcache_items: int | None = ...,
         force_writes: bool | None = ...,
         _options=...,
+        database: str | None = None,
     ) -> Model | None: ...
     @classmethod
     def get_by_id_async(
@@ -344,6 +350,7 @@ class Model(_NotEqualMixin, metaclass=MetaModel):
         max_memcache_items: int | None = ...,
         force_writes: bool | None = ...,
         _options=...,
+        database: str | None = None,
     ) -> tasklets_module.Future: ...
     @classmethod
     def get_or_insert(
@@ -409,7 +416,7 @@ class Expando(Model):
     def __delattr__(self, name: str) -> None: ...
 
 def get_multi_async(
-    keys: Sequence[type[key_module.Key]],
+    keys: Sequence[key_module.Key],
     read_consistency: Literal["EVENTUAL"] | None = ...,
     read_policy: Literal["EVENTUAL"] | None = ...,
     transaction: bytes | None = ...,
@@ -424,10 +431,10 @@ def get_multi_async(
     memcache_timeout: int | None = ...,
     max_memcache_items: int | None = ...,
     force_writes: bool | None = ...,
-    _options: object | None = ...,
-) -> list[type[tasklets_module.Future]]: ...
+    _options: object = None,
+) -> list[tasklets_module.Future]: ...
 def get_multi(
-    keys: Sequence[type[key_module.Key]],
+    keys: Sequence[key_module.Key],
     read_consistency: Literal["EVENTUAL"] | None = ...,
     read_policy: Literal["EVENTUAL"] | None = ...,
     transaction: bytes | None = ...,
@@ -442,10 +449,10 @@ def get_multi(
     memcache_timeout: int | None = ...,
     max_memcache_items: int | None = ...,
     force_writes: bool | None = ...,
-    _options: object | None = ...,
-) -> list[type[Model] | None]: ...
+    _options: object = None,
+) -> list[Model | None]: ...
 def put_multi_async(
-    entities: list[type[Model]],
+    entities: list[Model],
     retries: int | None = ...,
     timeout: float | None = ...,
     deadline: float | None = ...,
@@ -457,7 +464,7 @@ def put_multi_async(
     memcache_timeout: int | None = ...,
     max_memcache_items: int | None = ...,
     force_writes: bool | None = ...,
-    _options: object | None = ...,
+    _options: object = None,
 ) -> list[tasklets_module.Future]: ...
 def put_multi(
     entities: list[Model],
@@ -472,10 +479,10 @@ def put_multi(
     memcache_timeout: int | None = ...,
     max_memcache_items: int | None = ...,
     force_writes: bool | None = ...,
-    _options: object | None = ...,
+    _options: object = None,
 ) -> list[key_module.Key]: ...
 def delete_multi_async(
-    keys: list[key_module.Key],
+    keys: Sequence[key_module.Key],
     retries: int | None = ...,
     timeout: float | None = ...,
     deadline: float | None = ...,
@@ -487,7 +494,7 @@ def delete_multi_async(
     memcache_timeout: int | None = ...,
     max_memcache_items: int | None = ...,
     force_writes: bool | None = ...,
-    _options: object | None = ...,
+    _options: object = None,
 ) -> list[tasklets_module.Future]: ...
 def delete_multi(
     keys: Sequence[key_module.Key],
@@ -502,7 +509,7 @@ def delete_multi(
     memcache_timeout: int | None = ...,
     max_memcache_items: int | None = ...,
     force_writes: bool | None = ...,
-    _options: object | None = ...,
+    _options: object = None,
 ) -> list[None]: ...
-def get_indexes_async(**options: object) -> NoReturn: ...
-def get_indexes(**options: object) -> NoReturn: ...
+def get_indexes_async(**options: Unused) -> NoReturn: ...
+def get_indexes(**options: Unused) -> NoReturn: ...
